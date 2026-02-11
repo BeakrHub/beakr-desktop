@@ -1,0 +1,35 @@
+[package]
+name = "beakr-desktop"
+version = "0.1.0"
+description = "Beakr Desktop Agent — local file access for AI"
+authors = ["Beakr"]
+edition = "2021"
+
+[lib]
+name = "beakr_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-store = "2"
+tauri-plugin-autostart = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+http = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+glob = "0.3"
+hostname = "0.4"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+url = "2"
+base64 = "0.22"
