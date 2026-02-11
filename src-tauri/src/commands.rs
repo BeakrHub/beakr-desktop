@@ -246,6 +246,12 @@ fn store_token(app: &AppHandle, token: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Get the WebSocket URL (so the frontend can determine the environment).
+#[tauri::command]
+pub fn get_ws_url() -> String {
+    crate::ws_url()
+}
+
 fn http_client() -> reqwest::Client {
     reqwest::Client::new()
 }

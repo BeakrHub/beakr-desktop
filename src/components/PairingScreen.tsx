@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import BeakrLogo from "./BeakrLogo";
 
@@ -31,13 +31,15 @@ export default function PairingScreen({ onPaired }: PairingScreenProps) {
     }
   };
 
-  // Determine which environment we're pointing at
-  const wsUrl = (import.meta as any).env?.BEAKR_WS_URL || "";
-  const envLabel = wsUrl.includes("sandbox")
-    ? "Sandbox"
-    : wsUrl.includes("localhost")
-    ? "Local Dev"
-    : "Production";
+  // Determine which environment we're pointing at (read from Rust side)
+  const [envLabel, setEnvLabel] = useState("...");
+  useEffect(() => {
+    invoke<string>("get_ws_url").then((url) => {
+      if (url.includes("sandbox")) setEnvLabel("Sandbox");
+      else if (url.includes("localhost")) setEnvLabel("Local Dev");
+      else setEnvLabel("Production");
+    });
+  }, []);
 
   return (
     <div
