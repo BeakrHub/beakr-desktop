@@ -5,23 +5,19 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  build-macos:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-            artifact: Beakr-Desktop.dmg
-          - platform: macos-latest
-            target: x86_64-apple-darwin
-            artifact: Beakr-Desktop-x86.dmg
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: Beakr-Desktop.msi
+          - target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
 
-    runs-on: ${{ matrix.platform }}
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -44,17 +40,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Skip code signing for now (no Apple Developer secrets configured).
+      # tauri-action attempts codesign when APPLE_CERTIFICATE is set (even to ""),
+      # so we must not pass it at all until real secrets are added.
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Apple code signing (macOS only)
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Beakr Desktop ${{ github.ref_name }}"
@@ -62,3 +54,39 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Beakr Desktop ${{ github.ref_name }}"
+          releaseBody: "Desktop agent release ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
+          args: --target x86_64-pc-windows-msvc
