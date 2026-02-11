@@ -72,7 +72,7 @@ export default function Settings() {
 
       {IS_DEV ? (
         <p style={{ color: "#666", fontSize: "0.85rem", marginBottom: "1.5rem" }}>
-          Dev mode — using seed_alice credentials
+          Dev mode — using local dev credentials
         </p>
       ) : clerkUser?.user ? (
         <p style={{ color: "#666", fontSize: "0.85rem", marginBottom: "1.5rem" }}>

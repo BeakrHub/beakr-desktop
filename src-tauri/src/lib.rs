@@ -9,6 +9,19 @@ mod ws;
 use state::AppState;
 use tauri_plugin_autostart::MacosLauncher;
 
+/// Returns the WebSocket URL based on build configuration.
+/// Priority: BEAKR_WS_URL env var (compile-time) > debug=localhost > release=production
+pub fn ws_url() -> String {
+    if let Some(url) = option_env!("BEAKR_WS_URL") {
+        return url.to_string();
+    }
+    if cfg!(debug_assertions) {
+        "ws://localhost:8000/v1/desktop-agent/ws".to_string()
+    } else {
+        "wss://api.thebeakr.com/v1/desktop-agent/ws".to_string()
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Default to showing info-level logs in dev mode
@@ -68,11 +81,7 @@ pub fn run() {
                     // Brief delay to let state initialization complete
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                    let ws_url = if cfg!(debug_assertions) {
-                        "ws://localhost:8000/v1/desktop-agent/ws".to_string()
-                    } else {
-                        "wss://api.thebeakr.com/v1/desktop-agent/ws".to_string()
-                    };
+                    let ws_url = ws_url();
                     let client = ws::WsClient::new(app_handle, state_clone, ws_url);
                     client.run().await;
                 });

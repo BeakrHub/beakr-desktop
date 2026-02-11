@@ -19,11 +19,7 @@ pub async fn connect_ws(app: AppHandle, state: State<'_, AppState>) -> Result<()
         return Ok(());
     }
 
-    let ws_url = if cfg!(debug_assertions) {
-        "ws://localhost:8000/v1/desktop-agent/ws".to_string()
-    } else {
-        "wss://api.thebeakr.com/v1/desktop-agent/ws".to_string()
-    };
+    let ws_url = crate::ws_url();
 
     let state_clone = (*state).clone();
     let app_clone = app.clone();

@@ -22,6 +22,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Determine environment
+        id: env
+        run: |
+          # Use sandbox config if on sandbox branch, production otherwise
+          if git branch -r --contains HEAD | grep -q 'origin/sandbox'; then
+            echo "env_file=.env.sandbox" >> $GITHUB_OUTPUT
+          else
+            echo "env_file=.env.production" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Load environment variables
+        run: |
+          cat ${{ steps.env.outputs.env_file }} >> $GITHUB_ENV
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -63,6 +77,21 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        shell: bash
+        run: |
+          if git branch -r --contains HEAD | grep -q 'origin/sandbox'; then
+            echo "env_file=.env.sandbox" >> $GITHUB_OUTPUT
+          else
+            echo "env_file=.env.production" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Load environment variables
+        shell: bash
+        run: |
+          cat ${{ steps.env.outputs.env_file }} >> $GITHUB_ENV
 
       - name: Setup Node
         uses: actions/setup-node@v4
