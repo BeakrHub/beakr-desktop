@@ -1,10 +1,13 @@
 use tauri::{AppHandle, State};
+use tauri_plugin_store::StoreExt;
 
 use crate::config;
 use crate::state::{AppState, ConnectionStatus};
 use crate::ws::WsClient;
 
-/// Store a fresh JWT from the frontend's Clerk session.
+const STORE_FILE: &str = "settings.json";
+
+/// Store a fresh auth token from the frontend.
 #[tauri::command]
 pub async fn set_auth_token(state: State<'_, AppState>, token: String) -> Result<(), String> {
     *state.auth_token.write().await = Some(token);
@@ -124,4 +127,125 @@ pub async fn set_device_name(
     config::save_settings(&app, &settings);
 
     Ok(())
+}
+
+/// Claim a pairing code from the backend and store the returned device token.
+#[tauri::command]
+pub async fn claim_pairing_code(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    code: String,
+) -> Result<(), String> {
+    let device_name = state.device_name.read().await.clone();
+    let scoped_folders = state.scoped_folders.read().await.clone();
+
+    let platform = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+
+    // Build the API URL from WS URL (same host)
+    let ws_url = crate::ws_url();
+    let api_base = ws_url
+        .replace("ws://", "http://")
+        .replace("wss://", "https://")
+        .replace("/v1/desktop-agent/ws", "");
+
+    let url = format!("{}/v1/desktop-agent/pair/claim", api_base);
+
+    let platform_version = crate::ws::os_version();
+
+    let body = serde_json::json!({
+        "code": code,
+        "device_name": device_name,
+        "platform": platform,
+        "scoped_folders": scoped_folders,
+        "platform_version": platform_version,
+        "app_version": env!("CARGO_PKG_VERSION"),
+    });
+
+    // Make HTTP request using reqwest-lite via tokio_tungstenite's underlying HTTP
+    // We'll use a simple TCP + HTTP approach since we don't have reqwest
+    let client = http_client();
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&body).unwrap())
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("Failed to read response: {e}"))?;
+
+    if !status.is_success() {
+        // Try to extract detail from JSON response
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(detail) = json.get("detail").and_then(|d| d.as_str()) {
+                return Err(detail.to_string());
+            }
+        }
+        return Err(format!("Pairing failed (HTTP {})", status));
+    }
+
+    let result: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Invalid response: {e}"))?;
+
+    let device_token = result
+        .get("device_token")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing device_token in response")?;
+
+    // Store token persistently
+    store_token(&app, device_token)?;
+
+    // Set token in runtime state for immediate WS connection
+    *state.auth_token.write().await = Some(device_token.to_string());
+
+    Ok(())
+}
+
+/// Get stored device token from persistent store.
+#[tauri::command]
+pub fn get_stored_token(app: AppHandle) -> Result<Option<String>, String> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|e| format!("Failed to open store: {e}"))?;
+
+    Ok(store
+        .get("device_token")
+        .and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// Clear stored device token (unlink device).
+#[tauri::command]
+pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // Clear runtime state
+    *state.auth_token.write().await = None;
+
+    // Clear persistent store
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|e| format!("Failed to open store: {e}"))?;
+    let _ = store.delete("device_token");
+
+    Ok(())
+}
+
+fn store_token(app: &AppHandle, token: &str) -> Result<(), String> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|e| format!("Failed to open store: {e}"))?;
+    let _ = store.set(
+        "device_token",
+        serde_json::to_value(token).unwrap_or_default(),
+    );
+    Ok(())
+}
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::new()
 }

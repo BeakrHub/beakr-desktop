@@ -1,6 +1,6 @@
 [package]
 name = "beakr-desktop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Beakr Desktop Agent — local file access for AI"
 authors = ["Beakr"]
 edition = "2021"
@@ -33,3 +33,4 @@ log = "0.4"
 env_logger = "0.11"
 url = "2"
 base64 = "0.22"
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }

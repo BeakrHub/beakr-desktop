@@ -1,7 +1,7 @@
 {
   "name": "beakr-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,7 +10,6 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@clerk/clerk-react": "^5.60.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-shell": "^2",

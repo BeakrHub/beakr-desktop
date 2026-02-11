@@ -47,6 +47,16 @@ pub fn run() {
 
             // Load persisted settings
             let settings = config::load_settings(app.handle());
+            let has_stored_token = {
+                use tauri_plugin_store::StoreExt;
+                app.handle()
+                    .store("settings.json")
+                    .ok()
+                    .and_then(|store| store.get("device_token"))
+                    .and_then(|v| v.as_str().map(|s| !s.is_empty()))
+                    .unwrap_or(false)
+            };
+
             {
                 let state = app_state.clone();
                 let settings_folders = settings.scoped_folders.clone();
@@ -72,15 +82,38 @@ pub fn run() {
             // Set up system tray
             tray::setup_tray(app.handle())?;
 
-            // Auto-connect in dev mode or when auto_connect is enabled
-            if cfg!(debug_assertions) || settings.auto_connect {
-                log::info!("Auto-connecting WebSocket client on startup");
+            // Auto-connect if we have a stored device token
+            // (In dev mode without a token, the frontend will handle connection)
+            if has_stored_token {
+                log::info!("Found stored device token, auto-connecting on startup");
                 let app_handle = app.handle().clone();
                 let state_clone = app_state.clone();
+
                 tauri::async_runtime::spawn(async move {
+                    // Load token from store and set in state
+                    use tauri_plugin_store::StoreExt;
+                    if let Ok(store) = app_handle.store("settings.json") {
+                        if let Some(token) = store
+                            .get("device_token")
+                            .and_then(|v| serde_json::from_value::<String>(v).ok())
+                        {
+                            *state_clone.auth_token.write().await = Some(token);
+                        }
+                    }
+
                     // Brief delay to let state initialization complete
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
+                    let ws_url = ws_url();
+                    let client = ws::WsClient::new(app_handle, state_clone, ws_url);
+                    client.run().await;
+                });
+            } else if cfg!(debug_assertions) {
+                log::info!("Dev mode: auto-connecting WebSocket client");
+                let app_handle = app.handle().clone();
+                let state_clone = app_state.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let ws_url = ws_url();
                     let client = ws::WsClient::new(app_handle, state_clone, ws_url);
                     client.run().await;
@@ -100,6 +133,9 @@ pub fn run() {
             commands::set_device_name,
             commands::get_autostart,
             commands::set_autostart,
+            commands::claim_pairing_code,
+            commands::get_stored_token,
+            commands::clear_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -48,6 +48,7 @@ impl WsClient {
                     if close_code == Some(CLOSE_REVOKED) {
                         log::warn!("Device revoked by server");
                         self.set_status(ConnectionStatus::Revoked).await;
+                        let _ = self.app.emit("token_invalid", ());
                         return;
                     }
                     if close_code == Some(CLOSE_SESSION_EXPIRED) {
@@ -331,7 +332,7 @@ fn current_platform() -> &'static str {
     }
 }
 
-fn os_version() -> String {
+pub fn os_version() -> String {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("sw_vers")

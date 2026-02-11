@@ -1,62 +1,69 @@
-import { useEffect, useRef } from "react";
-import { useAuth as useClerkAuth } from "@clerk/clerk-react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-const TOKEN_REFRESH_INTERVAL = 50_000; // 50 seconds
-const IS_DEV = !import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
-
 /**
- * Manages the Clerk JWT lifecycle:
- * 1. On sign-in: pass token to Rust and auto-connect
- * 2. Every 50s: proactively refresh and pass to Rust
- * 3. On `token_refresh_needed` event from Rust: immediately refresh
+ * Manages device token lifecycle:
+ * 1. On mount: read stored token, pass to Rust, auto-connect
+ * 2. Listen for `token_invalid` event from Rust (revoked) → clear store
  *
- * In dev mode (no Clerk key), skips token management and auto-connects.
+ * No periodic refresh needed — device tokens are long-lived.
  */
 export function useAuth() {
-  const clerkAuth = IS_DEV ? null : useClerkAuth();
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [hasToken, setHasToken] = useState<boolean | null>(null);
   const didConnect = useRef(false);
 
-  // Dev mode: just auto-connect once, no token needed
   useEffect(() => {
-    if (!IS_DEV || didConnect.current) return;
-    didConnect.current = true;
-    invoke("connect_ws");
-  }, []);
+    let cancelled = false;
 
-  // Production mode: full Clerk token lifecycle
-  useEffect(() => {
-    if (IS_DEV || !clerkAuth?.isSignedIn) return;
-
-    const refreshToken = async () => {
+    async function init() {
       try {
-        const token = await clerkAuth.getToken({ template: "beakr" });
+        // Check if we have a stored token
+        const token = await invoke<string | null>("get_stored_token");
+        if (cancelled) return;
+
         if (token) {
+          // Pass token to Rust WS client and connect
           await invoke("set_auth_token", { token });
+          setHasToken(true);
+
+          if (!didConnect.current) {
+            didConnect.current = true;
+            invoke("connect_ws");
+          }
+        } else {
+          setHasToken(false);
         }
-      } catch (e) {
-        console.error("Failed to refresh token:", e);
+      } catch {
+        if (!cancelled) setHasToken(false);
       }
-    };
+    }
 
-    // Initial token pass + connect
-    refreshToken().then(() => {
-      invoke("connect_ws");
-    });
+    init();
 
-    // Periodic refresh
-    intervalRef.current = setInterval(refreshToken, TOKEN_REFRESH_INTERVAL);
-
-    // Listen for Rust requesting a fresh token (during reconnection)
-    const unlisten = listen("token_refresh_needed", () => {
-      refreshToken();
+    // Listen for token_invalid event (device revoked on server)
+    const unlisten = listen("token_invalid", () => {
+      invoke("clear_token").catch(() => {});
+      setHasToken(false);
+      didConnect.current = false;
     });
 
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      cancelled = true;
       unlisten.then((fn) => fn());
     };
-  }, [IS_DEV ? false : clerkAuth?.isSignedIn]);
+  }, []);
+
+  const clearToken = async () => {
+    try {
+      await invoke("disconnect_ws");
+      await invoke("clear_token");
+    } catch {
+      // ignore
+    }
+    setHasToken(false);
+    didConnect.current = false;
+  };
+
+  return { hasToken, clearToken };
 }

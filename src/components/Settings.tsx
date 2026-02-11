@@ -1,4 +1,3 @@
-import { useUser, useClerk } from "@clerk/clerk-react";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import BeakrLogo from "./BeakrLogo";
@@ -6,11 +5,11 @@ import ConnectionStatus from "./ConnectionStatus";
 import ActivityFeed from "./ActivityFeed";
 import FolderPicker from "./FolderPicker";
 
-const IS_DEV = !import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
+interface SettingsProps {
+  onUnlink: () => void;
+}
 
-export default function Settings() {
-  const clerkUser = IS_DEV ? null : useUser();
-  const clerk = IS_DEV ? null : useClerk();
+export default function Settings({ onUnlink }: SettingsProps) {
   const [deviceName, setDeviceName] = useState("");
   const [editingName, setEditingName] = useState(false);
 
@@ -41,44 +40,20 @@ export default function Settings() {
             Beakr Desktop
           </h1>
         </div>
-        {IS_DEV ? (
-          <span
-            style={{
-              fontSize: "0.75rem",
-              padding: "0.2rem 0.5rem",
-              background: "#fef3c7",
-              color: "#92400e",
-              borderRadius: 4,
-            }}
-          >
-            Dev Mode
-          </span>
-        ) : (
-          <button
-            onClick={() => clerk?.signOut()}
-            style={{
-              fontSize: "0.8rem",
-              padding: "0.25rem 0.75rem",
-              border: "1px solid #ddd",
-              borderRadius: 6,
-              background: "white",
-              cursor: "pointer",
-            }}
-          >
-            Sign Out
-          </button>
-        )}
+        <button
+          onClick={onUnlink}
+          style={{
+            fontSize: "0.8rem",
+            padding: "0.25rem 0.75rem",
+            border: "1px solid #ddd",
+            borderRadius: 6,
+            background: "white",
+            cursor: "pointer",
+          }}
+        >
+          Unlink Device
+        </button>
       </div>
-
-      {IS_DEV ? (
-        <p style={{ color: "#666", fontSize: "0.85rem", marginBottom: "1.5rem" }}>
-          Dev mode — using local dev credentials
-        </p>
-      ) : clerkUser?.user ? (
-        <p style={{ color: "#666", fontSize: "0.85rem", marginBottom: "1.5rem" }}>
-          Signed in as {clerkUser.user.primaryEmailAddress?.emailAddress}
-        </p>
-      ) : null}
 
       <ConnectionStatus />
 
