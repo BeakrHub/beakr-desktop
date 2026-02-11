@@ -136,6 +136,7 @@ pub fn run() {
             commands::claim_pairing_code,
             commands::get_stored_token,
             commands::clear_token,
+            commands::get_ws_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
