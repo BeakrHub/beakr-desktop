@@ -40,13 +40,16 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # Skip code signing for now (no Apple Developer secrets configured).
-      # tauri-action attempts codesign when APPLE_CERTIFICATE is set (even to ""),
-      # so we must not pass it at all until real secrets are added.
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ""
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Beakr Desktop ${{ github.ref_name }}"
