@@ -24,9 +24,11 @@ jobs:
 
       - name: Determine environment
         id: env
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          # Use sandbox config if on sandbox branch, production otherwise
-          if git branch -r --contains HEAD | grep -q 'origin/sandbox'; then
+          # Use tag name to pick env file (detached HEAD can't resolve branches)
+          if [[ "$TAG_NAME" == *"sandbox"* ]]; then
             echo "env_file=.env.sandbox" >> $GITHUB_OUTPUT
           else
             echo "env_file=.env.production" >> $GITHUB_OUTPUT
@@ -50,6 +52,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          shared-key: ${{ github.ref_name }}
 
       - name: Install frontend dependencies
         run: npm ci
@@ -81,8 +84,10 @@ jobs:
       - name: Determine environment
         id: env
         shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          if git branch -r --contains HEAD | grep -q 'origin/sandbox'; then
+          if [[ "$TAG_NAME" == *"sandbox"* ]]; then
             echo "env_file=.env.sandbox" >> $GITHUB_OUTPUT
           else
             echo "env_file=.env.production" >> $GITHUB_OUTPUT
@@ -107,6 +112,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          shared-key: ${{ github.ref_name }}
 
       - name: Install frontend dependencies
         run: npm ci
