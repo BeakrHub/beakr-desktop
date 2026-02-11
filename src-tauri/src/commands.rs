@@ -253,5 +253,8 @@ pub fn get_ws_url() -> String {
 }
 
 fn http_client() -> reqwest::Client {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .user_agent(format!("BeakrDesktop/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("failed to build HTTP client")
 }
