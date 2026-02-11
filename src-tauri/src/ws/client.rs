@@ -103,12 +103,18 @@ impl WsClient {
         let token = self.state.auth_token.read().await.clone();
 
         // Build request — use subprotocol auth in production, query params in dev
+        let user_agent = format!("BeakrDesktop/{}", env!("CARGO_PKG_VERSION"));
+
         let (ws_stream, _response) = if let Some(token) = token {
             let mut request = self.ws_url.as_str().into_client_request()?;
             let subprotocol = format!("beakr-v1, bearer.{token}");
             request.headers_mut().insert(
                 "Sec-WebSocket-Protocol",
                 HeaderValue::from_str(&subprotocol)?,
+            );
+            request.headers_mut().insert(
+                "User-Agent",
+                HeaderValue::from_str(&user_agent)?,
             );
             tokio_tungstenite::connect_async(request).await?
         } else if cfg!(debug_assertions) {
@@ -117,7 +123,11 @@ impl WsClient {
                 "{}?identity_id=dev_local&email=dev@localhost&identity_name=dev&display_name=Dev+User",
                 self.ws_url
             );
-            let request = dev_url.as_str().into_client_request()?;
+            let mut request = dev_url.as_str().into_client_request()?;
+            request.headers_mut().insert(
+                "User-Agent",
+                HeaderValue::from_str(&user_agent)?,
+            );
             tokio_tungstenite::connect_async(request).await?
         } else {
             return Err("No auth token available".into());
