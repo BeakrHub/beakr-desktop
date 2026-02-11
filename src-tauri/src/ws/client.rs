@@ -112,9 +112,8 @@ impl WsClient {
             tokio_tungstenite::connect_async(request).await?
         } else if cfg!(debug_assertions) {
             // Dev mode: use query params for auth (matches backend dev bypass)
-            // identity_name must be "seed" to match the seeded web app user
             let dev_url = format!(
-                "{}?identity_id=seed_todd&email=todd.constable@yale.edu&identity_name=seed&display_name=Todd+Constable",
+                "{}?identity_id=dev_local&email=dev@localhost&identity_name=dev&display_name=Dev+User",
                 self.ws_url
             );
             let request = dev_url.as_str().into_client_request()?;
