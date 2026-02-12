@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use walkdir::WalkDir;
 
 use crate::security;
+use crate::unicode;
 
 /// Handle a `search_files` request.
 ///
@@ -88,19 +89,21 @@ pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, 
                 match search_file_content(entry_path, &query_lower) {
                     Some(context) => {
                         results.push(json!({
-                            "path": entry_path.display().to_string(),
-                            "name": file_name,
+                            "path": unicode::normalize_whitespace(&entry_path.display().to_string()),
+                            "name": unicode::normalize_whitespace(&file_name),
                             "match_context": context,
                         }));
                     }
                     None => continue,
                 }
             } else {
-                // Filename search
-                if file_name.to_lowercase().contains(&query_lower) {
+                // Filename search — match against normalized name so queries
+                // with ASCII space still find files with Unicode whitespace
+                let normalized_name = unicode::normalize_whitespace(&file_name);
+                if normalized_name.to_lowercase().contains(&query_lower) {
                     results.push(json!({
-                        "path": entry_path.display().to_string(),
-                        "name": file_name,
+                        "path": unicode::normalize_whitespace(&entry_path.display().to_string()),
+                        "name": normalized_name,
                     }));
                 }
             }

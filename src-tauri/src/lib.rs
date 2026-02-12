@@ -4,6 +4,7 @@ mod security;
 mod state;
 mod tools;
 mod tray;
+pub mod unicode;
 mod ws;
 
 use state::AppState;

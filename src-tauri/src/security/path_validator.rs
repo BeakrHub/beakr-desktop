@@ -1,11 +1,17 @@
 use std::path::{Path, PathBuf};
 
 use super::SecurityError;
+use crate::unicode;
 
 /// Validate that `path` resolves to a location within one of the `scoped_folders`.
 ///
 /// 1. Canonicalize the path (resolves symlinks, `..`, etc.)
 /// 2. Check that the canonical path starts with at least one scoped folder
+///
+/// If canonicalization fails (file not found), attempts a fuzzy match by
+/// normalizing Unicode whitespace in the filename.  macOS uses non-ASCII
+/// whitespace in system-generated names (e.g. U+202F before AM/PM in
+/// screenshots) which LLMs replace with regular ASCII space.
 ///
 /// Returns the canonicalized path on success.
 pub fn validate_path(path: &str, scoped_folders: &[String]) -> Result<PathBuf, SecurityError> {
@@ -17,10 +23,22 @@ pub fn validate_path(path: &str, scoped_folders: &[String]) -> Result<PathBuf, S
 
     let target = Path::new(path);
 
-    // Canonicalize resolves symlinks and relative components
-    let canonical = std::fs::canonicalize(target).map_err(|e| {
-        SecurityError::ResolutionFailed(format!("{path}: {e}"))
-    })?;
+    // Canonicalize resolves symlinks and relative components.
+    // If it fails (file not found), try resolving Unicode whitespace mismatches.
+    let canonical = match std::fs::canonicalize(target) {
+        Ok(p) => p,
+        Err(original_err) => {
+            if let Some(resolved) = unicode::try_resolve_unicode_path(path) {
+                std::fs::canonicalize(&resolved).map_err(|e| {
+                    SecurityError::ResolutionFailed(format!("{path}: {e}"))
+                })?
+            } else {
+                return Err(SecurityError::ResolutionFailed(format!(
+                    "{path}: {original_err}"
+                )));
+            }
+        }
+    };
 
     for folder in scoped_folders {
         let folder_canonical = match std::fs::canonicalize(folder) {

@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 use walkdir::WalkDir;
 
 use crate::security;
+use crate::unicode;
 
 /// Handle a `list_files` request.
 ///
@@ -79,8 +80,8 @@ pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, 
         });
 
         files.push(json!({
-            "name": file_name,
-            "path": entry_path.display().to_string(),
+            "name": unicode::normalize_whitespace(&file_name),
+            "path": unicode::normalize_whitespace(&entry_path.display().to_string()),
             "size": metadata.len(),
             "type": file_type,
             "modified_at": modified_at,
