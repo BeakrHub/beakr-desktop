@@ -9,9 +9,14 @@ use crate::state::ConnectionStatus;
 const WINDOW_LABEL: &str = "settings";
 const WINDOW_TITLE: &str = "Beakr Desktop";
 
-/// Holds the tray status menu item so we can update its text later.
+/// Holds the tray menu items whose text we update at runtime.
 pub struct TrayState {
     pub status_item: MenuItem<tauri::Wry>,
+    /// Opens the app/pairing window. Its label is state-aware: "Pair device"
+    /// when no device is paired (it lands on the pairing screen) and "Open Beakr"
+    /// once paired (the window is the device's status/folders/activity view, not
+    /// just preferences).
+    pub settings_item: MenuItem<tauri::Wry>,
 }
 
 /// Build the system tray icon and menu.
@@ -20,13 +25,16 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .enabled(false)
         .build(app)?;
 
-    // Store the menu item handle so we can update it when connection status changes
+    // Default to the unpaired label; lib.rs updates it from the stored token at
+    // startup, and claim_pairing_code/clear_token update it as pairing changes.
+    let settings_item = MenuItemBuilder::with_id("settings", "Pair device")
+        .build(app)?;
+
+    // Store the menu item handles so we can update them at runtime.
     app.manage(TrayState {
         status_item: status_item.clone(),
+        settings_item: settings_item.clone(),
     });
-
-    let settings_item = MenuItemBuilder::with_id("settings", "Settings…")
-        .build(app)?;
 
     let quit_item = MenuItemBuilder::with_id("quit", "Quit Beakr")
         .build(app)?;
@@ -99,5 +107,15 @@ pub fn update_tray_status(app: &AppHandle, status: &ConnectionStatus) {
     let text = format!("Status: {status}");
     if let Some(tray_state) = app.try_state::<TrayState>() {
         let _ = tray_state.status_item.set_text(&text);
+    }
+}
+
+/// Update the menu item label to reflect whether a device is paired.
+/// Unpaired -> "Pair device" (the window opens on the pairing screen); paired ->
+/// "Open Beakr". The click action is unchanged; only the label adapts.
+pub fn update_tray_pairing(app: &AppHandle, is_paired: bool) {
+    let label = if is_paired { "Open Beakr" } else { "Pair device" };
+    if let Some(tray_state) = app.try_state::<TrayState>() {
+        let _ = tray_state.settings_item.set_text(label);
     }
 }

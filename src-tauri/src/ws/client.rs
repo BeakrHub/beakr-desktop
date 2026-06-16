@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -66,8 +67,8 @@ impl WsClient {
                 }
             }
 
-            // Check if shutdown was requested
-            if self.is_shutdown_requested().await {
+            // Stop reconnecting if the user explicitly disconnected.
+            if self.state.shutdown_requested.load(Ordering::SeqCst) {
                 self.set_status(ConnectionStatus::Disconnected).await;
                 return;
             }
@@ -87,10 +88,13 @@ impl WsClient {
 
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
-                _ = self.state.ws_shutdown.notified() => {
-                    self.set_status(ConnectionStatus::Disconnected).await;
-                    return;
-                }
+                _ = self.state.ws_shutdown.notified() => {}
+            }
+
+            // Re-check after waking: a disconnect during backoff should stop here.
+            if self.state.shutdown_requested.load(Ordering::SeqCst) {
+                self.set_status(ConnectionStatus::Disconnected).await;
+                return;
             }
 
             // Brief wait for token to arrive
@@ -241,8 +245,13 @@ impl WsClient {
                 }
 
                 _ = self.state.ws_shutdown.notified() => {
-                    let _ = write.send(Message::Close(None)).await;
-                    return None;
+                    // Only tear down on a real, user-requested disconnect. A stray
+                    // notify permit left over from a previous disconnect must not
+                    // close a freshly re-established connection.
+                    if self.state.shutdown_requested.load(Ordering::SeqCst) {
+                        let _ = write.send(Message::Close(None)).await;
+                        return None;
+                    }
                 }
             }
         }
@@ -323,13 +332,6 @@ impl WsClient {
         let _ = self.app.emit("ws:status_changed", status_str);
     }
 
-    async fn is_shutdown_requested(&self) -> bool {
-        // Check if the notify has been triggered by trying with zero timeout
-        tokio::select! {
-            _ = self.state.ws_shutdown.notified() => true,
-            _ = tokio::time::sleep(Duration::ZERO) => false,
-        }
-    }
 }
 
 fn current_platform() -> &'static str {

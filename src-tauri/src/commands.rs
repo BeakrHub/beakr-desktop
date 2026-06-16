@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use tauri::{AppHandle, State};
 use tauri_plugin_store::StoreExt;
 
@@ -24,6 +26,9 @@ pub async fn connect_ws(app: AppHandle, state: State<'_, AppState>) -> Result<()
 
     let ws_url = crate::ws_url();
 
+    // Clear any prior disconnect request so the run loop will stay connected.
+    state.shutdown_requested.store(false, Ordering::SeqCst);
+
     let state_clone = (*state).clone();
     let app_clone = app.clone();
 
@@ -38,6 +43,10 @@ pub async fn connect_ws(app: AppHandle, state: State<'_, AppState>) -> Result<()
 /// Disconnect the WebSocket.
 #[tauri::command]
 pub async fn disconnect_ws(state: State<'_, AppState>) -> Result<(), String> {
+    // Record the intent durably before notifying: the message loop may consume the
+    // notify permit and tear down the socket before the run loop re-checks, so the
+    // flag — not the permit — is what keeps it from auto-reconnecting.
+    state.shutdown_requested.store(true, Ordering::SeqCst);
     state.ws_shutdown.notify_one();
     Ok(())
 }
@@ -205,6 +214,9 @@ pub async fn claim_pairing_code(
     // Set token in runtime state for immediate WS connection
     *state.auth_token.write().await = Some(device_token.to_string());
 
+    // Device is now paired — reflect that in the tray menu label.
+    crate::tray::update_tray_pairing(&app, true);
+
     Ok(())
 }
 
@@ -231,6 +243,9 @@ pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(
         .store(STORE_FILE)
         .map_err(|e| format!("Failed to open store: {e}"))?;
     let _ = store.delete("device_token");
+
+    // Device is no longer paired — reflect that in the tray menu label.
+    crate::tray::update_tray_pairing(&app, false);
 
     Ok(())
 }
