@@ -232,9 +232,13 @@ pub fn get_stored_token(app: AppHandle) -> Result<Option<String>, String> {
         .and_then(|v| serde_json::from_value(v).ok()))
 }
 
-/// Clear stored device token (unlink device).
-#[tauri::command]
-pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+/// Unlink the device: drop the runtime token, delete it from the persistent
+/// store, and flip the tray label back to "Pair device". Shared by the
+/// `clear_token` command (user-initiated "Unlink Device") and the WS client's
+/// revocation path, which must unlink authoritatively in Rust because the app
+/// runs as a menu-bar accessory with no webview alive at startup to handle the
+/// `token_invalid` event.
+pub(crate) async fn clear_device_token(app: &AppHandle, state: &AppState) -> Result<(), String> {
     // Clear runtime state
     *state.auth_token.write().await = None;
 
@@ -245,9 +249,15 @@ pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(
     let _ = store.delete("device_token");
 
     // Device is no longer paired — reflect that in the tray menu label.
-    crate::tray::update_tray_pairing(&app, false);
+    crate::tray::update_tray_pairing(app, false);
 
     Ok(())
+}
+
+/// Clear stored device token (unlink device).
+#[tauri::command]
+pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    clear_device_token(&app, &state).await
 }
 
 fn store_token(app: &AppHandle, token: &str) -> Result<(), String> {
