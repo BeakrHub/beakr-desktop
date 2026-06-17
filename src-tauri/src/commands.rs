@@ -217,6 +217,27 @@ pub async fn claim_pairing_code(
     // Device is now paired — reflect that in the tray menu label.
     crate::tray::update_tray_pairing(&app, true);
 
+    // NOTE: we deliberately do NOT force a reconnect here, and that is correct
+    // for production. Pairing is reached from the PairingScreen, which only shows
+    // when there is no token and (in a release build) no live connection — so the
+    // frontend's subsequent connect_ws() is a clean first connect using the token
+    // just stored above.
+    //
+    // The one place this is imperfect is the DEV build: it auto-connects as a
+    // throwaway `dev_local` device on startup (see lib.rs, gated on
+    // debug_assertions), so a live "ghost" connection already exists when you
+    // pair. connect_ws() no-ops while already connected, so the new token does not
+    // take over until that ghost connection drops (heartbeat timeout, ~90s) or the
+    // user toggles Disconnect -> Connect. This is a dev-only ergonomic quirk, not a
+    // production bug, so it is intentionally left as-is.
+    //
+    // Do NOT "fix" this by calling disconnect_ws() then connect_ws() here: that can
+    // leave the old run() loop racing the `shutdown_requested` flag and spawn a
+    // second concurrent reconnect loop — the exact reconnect-race class ENG-758
+    // stabilized. If a real "switch account while connected" flow is ever needed,
+    // do it as a single-loop reconnect SIGNAL (a force_reconnect Notify handled
+    // inside the existing message loop), never as disconnect-then-reconnect.
+
     Ok(())
 }
 
