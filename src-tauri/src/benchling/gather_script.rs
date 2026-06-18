@@ -112,28 +112,46 @@ pub const BENCHLING_GATHER_SCRIPT: &str = r#####"
     return joined || (entry.name || "");
   }
 
-  function mapEntry(e, folder) {
-    return {
-      external_id: e.id || e.apiId || e.api_identifier || "",
-      kind: "entry",
-      title: e.name || e.displayName || "(untitled entry)",
-      url: abs(e.webURL || e.url || (e.id ? "/" + e.id : null)),
-      content: entryToText(e),
-      checksum: String(e.modifiedAt || e.updatedAt || e.modified_at || e.id || ""),
-      metadata: { folder_id: folder.external_id, folder_name: folder.title },
-    };
+  function kindForId(id) {
+    if (!id) return "file";
+    if (id.indexOf("etr_") === 0) return "entry";
+    if (id.indexOf("seq_") === 0 || id.indexOf("dseq_") === 0) return "dna_sequence";
+    if (id.indexOf("aseq_") === 0 || id.indexOf("prot_") === 0) return "aa_sequence";
+    if (id.indexOf("bfi_") === 0) return "custom_entity";
+    return "file";
   }
 
-  function mapSequence(s, kind, folder) {
-    const bases = s.bases || s.sequence || s.aminoAcids || "";
+  // Per-item content fetch (confirmed path: GET /1/api/entries/<id>?view=true).
+  async function fetchEntryDetail(id) {
+    try {
+      return await apiGet("/entries/" + encodeURIComponent(id) + "?view=true");
+    } catch (e) {
+      if (e && e.needsLogin) throw e;
+      return null;
+    }
+  }
+
+  // Build an item from a get-nested-files files[] element (+ optional detail).
+  function mapFile(f, detail, folder) {
+    const id = f.id || f.api_identifier || "";
+    const kind = kindForId(id);
+    let content;
+    if (kind === "entry") {
+      content = entryToText(detail || f);
+    } else if (detail) {
+      const bases = detail.bases || detail.sequence || detail.aminoAcids || "";
+      content = bases ? ((detail.name || f.name || "") + "\n" + bases) : (detail.name || f.name || "");
+    } else {
+      content = f.name || "";
+    }
     return {
-      external_id: s.id || s.apiId || s.api_identifier || "",
-      kind: kind, // dna_sequence | aa_sequence | custom_entity
-      title: s.name || s.displayName || "(untitled)",
-      url: abs(s.webURL || s.url || (s.id ? "/" + s.id : null)),
-      content: bases ? (s.name ? s.name + "\n" + bases : bases) : (s.name || ""),
-      checksum: String(s.modifiedAt || s.updatedAt || s.modified_at || s.id || ""),
-      metadata: { folder_id: folder.external_id, folder_name: folder.title, length: s.length || (bases ? bases.length : null) },
+      external_id: id,
+      kind: kind,
+      title: f.name || (detail && detail.name) || "(untitled)",
+      url: abs(f.path || f.webURL || f.url || (id ? "/" + id : null)),
+      content: content,
+      checksum: String((detail && (detail.modifiedAt || detail.updatedAt)) || f.modifiedAt || f.updatedAt || id || ""),
+      metadata: { folder_id: folder.external_id, folder_name: folder.title, path: f.path || null },
     };
   }
 
@@ -152,26 +170,24 @@ pub const BENCHLING_GATHER_SCRIPT: &str = r#####"
   }
 
   // =========================================================================
-  // ENTRY / SEQUENCE FETCHING — THE ONE UNCERTAIN FUNCTION.
+  // FOLDER CONTENTS — confirmed against a live session 2026-06-18.
   //
-  // Confirmed from a stale session (401, not 404) that these endpoints EXIST:
-  //   GET /1/api/entries?folderId=<lib_...>
-  //   GET /1/api/dna-sequences?folderId=<lib_...>
-  //   GET /1/api/aa-sequences            (folder filter param unconfirmed)
-  //   GET /1/api/custom-entities         (folder filter param unconfirmed)
+  // CONFIRMED endpoints (these are the real ones the SPA uses):
+  //   GET /1/api/folders                                       -> array of folders
+  //   GET /1/api/folders/actions/get-nested-files?folderId=<lib_..>
+  //        -> { files: [ {id, name, path, ...} ] }   (also accepts folderIds)
+  //   GET /1/api/entries/<id>?view=true                        -> one entry's note tree
   //
-  // UNKNOWNS to confirm against a FRESH + POPULATED account, then edit here only:
-  //   1. Exact filter param name (folderId vs folder_id vs projectId).
-  //   2. Whether aa-sequences / custom-entities accept the same folder filter.
-  //   3. The response envelope key. We try, in order: entries / dnaSequences /
-  //      aaSequences / customEntities / results / data / items, else assume the
-  //      response itself is the array.
-  //   4. Pagination (nextToken / pageToken / offset) — currently single-page.
-  //   5. Whether list responses include note content or only a summary (if only
-  //      a summary, a per-id GET /1/api/entries/<id> follow-up will be needed).
+  // NOTE: /1/api/entries?folderId= does NOT exist (404). Listing a folder's
+  // contents is ONLY via get-nested-files; per-item content is a follow-up
+  // GET /1/api/entries/<id>. We route files by Benchling id prefix (etr_/seq_/...).
   //
-  // We deliberately swallow per-endpoint errors (except needs_login) so one
-  // unconfirmed shape never aborts the whole import.
+  // STILL UNCONFIRMED (the test account had zero content — every folder returned
+  // files:[]). Edit ONLY the marked spots when a POPULATED account is available:
+  //   1. The full set of fields on a files[] item (confirmed so far: id,name,path).
+  //   2. The note-content JSON shape from /1/api/entries/<id>?view=true, which
+  //      entryToText() flattens best-effort.
+  //   3. Pagination token key on get-nested-files (handled if `nextToken` present).
   // =========================================================================
   function pickArray(resp, keys) {
     if (Array.isArray(resp)) return resp;
@@ -190,39 +206,32 @@ pub const BENCHLING_GATHER_SCRIPT: &str = r#####"
   async function fetchFolderItems(folder) {
     const items = [];
     const fid = encodeURIComponent(folder.external_id);
+    let nextToken = null;
+    let guard = 0;
 
-    // Each endpoint is attempted independently; a failure on one (e.g. an
-    // unconfirmed param) must not kill the others.
-    const attempts = [
-      { path: API + "/entries?folderId=" + fid, keys: ["entries", "results", "data", "items"], kind: "entry" },
-      { path: API + "/dna-sequences?folderId=" + fid, keys: ["dnaSequences", "results", "data", "items"], kind: "dna_sequence" },
-      { path: API + "/aa-sequences?folderId=" + fid, keys: ["aaSequences", "results", "data", "items"], kind: "aa_sequence" },
-      { path: API + "/custom-entities?folderId=" + fid, keys: ["customEntities", "results", "data", "items"], kind: "custom_entity" },
-    ];
-
-    for (const a of attempts) {
+    do {
+      guard += 1;
       let resp;
+      const path = "/folders/actions/get-nested-files?folderId=" + fid +
+        (nextToken ? "&nextToken=" + encodeURIComponent(nextToken) : "");
       try {
-        const headers = { "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" };
-        const token = csrfToken();
-        if (token) headers["X-CSRFToken"] = token;
-        const r = await fetch(a.path, { method: "GET", credentials: "include", headers: headers });
-        if (r.status === 401) {
-          const err = new Error("needs_login");
-          err.needsLogin = true;
-          throw err;
-        }
-        if (!r.ok) continue; // unconfirmed/unsupported endpoint for this account — skip
-        resp = await r.json();
+        resp = await apiGet(path);
       } catch (e) {
         if (e && e.needsLogin) throw e;
-        continue;
+        break; // folder not listable for this account — skip its contents
       }
-      const arr = pickArray(resp, a.keys);
-      for (const raw of arr) {
-        items.push(a.kind === "entry" ? mapEntry(raw, folder) : mapSequence(raw, a.kind, folder));
+      const files = pickArray(resp, ["files", "items", "results", "data"]);
+      for (const f of files) {
+        const id = f.id || f.api_identifier;
+        if (!id) continue;
+        // Notebook entries need a follow-up GET for their note content;
+        // other file types use the listing metadata as-is.
+        const detail = kindForId(id) === "entry" ? await fetchEntryDetail(id) : null;
+        items.push(mapFile(f, detail, folder));
       }
-    }
+      nextToken = (resp && (resp.nextToken || resp.next_token)) || null;
+    } while (nextToken && guard < 50);
+
     return items;
   }
 
