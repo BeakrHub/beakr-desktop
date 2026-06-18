@@ -35,6 +35,10 @@ pub struct AppState {
     pub ws_shutdown: Arc<tokio::sync::Notify>,
     /// Notifies the WS client when scoped_folders are changed via the UI.
     pub folders_changed: Arc<tokio::sync::Notify>,
+    /// Port of the running Benchling localhost data bridge, if open.
+    pub benchling_bridge_port: Arc<RwLock<Option<u16>>>,
+    /// Notifies the Benchling bridge listener to shut down.
+    pub benchling_bridge_shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -52,6 +56,8 @@ impl AppState {
             device_id: Arc::new(RwLock::new(None)),
             ws_shutdown: Arc::new(tokio::sync::Notify::new()),
             folders_changed: Arc::new(tokio::sync::Notify::new()),
+            benchling_bridge_port: Arc::new(RwLock::new(None)),
+            benchling_bridge_shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
