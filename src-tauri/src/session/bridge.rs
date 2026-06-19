@@ -279,3 +279,12 @@ pub fn emit_error(app: &AppHandle, provider: &str, message: &str) {
         serde_json::json!({ "provider": provider, "message": message }),
     );
 }
+
+/// Emits `session:disconnected` when the captured live session has died (idle /
+/// expired / logged out) so the UI stops showing "connected".
+pub fn emit_disconnected(app: &AppHandle, provider: &str) {
+    let _ = app.emit(
+        "session:disconnected",
+        serde_json::json!({ "provider": provider }),
+    );
+}

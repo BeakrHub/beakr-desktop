@@ -92,6 +92,18 @@ pub fn run() {
             #[cfg(debug_assertions)]
             tray::show_settings_window(app.handle());
 
+            // Keep the live Benchling session status honest: a background task
+            // detects when the captured session dies (idle/expired/logout) and
+            // flips the UI + backend to "not connected".
+            {
+                let app_handle = app.handle().clone();
+                let liveness_state = app_state.clone();
+                tauri::async_runtime::spawn(session::benchling::watch_session_liveness(
+                    app_handle,
+                    liveness_state,
+                ));
+            }
+
             // Auto-connect if we have a stored device token
             // (In dev mode without a token, the frontend will handle connection)
             if has_stored_token {

@@ -213,3 +213,57 @@ pub async fn watch_for_login(app: AppHandle, state: AppState, window_label: Stri
         tokio::time::sleep(LOGIN_POLL_INTERVAL).await;
     }
 }
+
+/// Interval between background liveness checks of the captured Benchling session.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Reports to the backend that the live Benchling session has ended, so the web
+/// connector card reflects the lost session (best-effort).
+async fn report_disconnect(token: &str) {
+    let url = format!("{}/v1/connectors/benchling-desktop/disconnect", api_base());
+    let _ = http_client()
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await;
+}
+
+/// Long-lived task that keeps the UI and backend honest about the live Benchling
+/// session. Every [`LIVENESS_INTERVAL`] it inspects the captured session: if it
+/// has died (401 from `/1/api/users/me`) or was cleared by a failed tool call,
+/// it clears the session, emits `session:disconnected`, and reports the
+/// disconnect to the backend. Transient network errors are ignored so a blip
+/// does not produce a false disconnect.
+pub async fn watch_session_liveness(app: AppHandle, state: AppState) {
+    let mut was_live = false;
+    loop {
+        tokio::time::sleep(LIVENESS_INTERVAL).await;
+
+        let session = { state.benchling_session.read().await.clone() };
+        match session {
+            None => {
+                if was_live {
+                    // A tool call cleared the session on a 401 — surface it now.
+                    crate::session::bridge::emit_disconnected(&app, "benchling");
+                    if let Some(token) = state.auth_token.read().await.clone() {
+                        report_disconnect(&token).await;
+                    }
+                    was_live = false;
+                }
+            }
+            Some(sess) => match probe_users_me(&sess.session_cookie).await {
+                Ok(Some(_)) => was_live = true,
+                Ok(None) => {
+                    // 401 — the session expired or the user logged out.
+                    *state.benchling_session.write().await = None;
+                    crate::session::bridge::emit_disconnected(&app, "benchling");
+                    if let Some(token) = state.auth_token.read().await.clone() {
+                        report_disconnect(&token).await;
+                    }
+                    was_live = false;
+                }
+                Err(_) => { /* transient error — leave the session intact */ }
+            },
+        }
+    }
+}

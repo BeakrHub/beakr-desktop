@@ -122,6 +122,16 @@ export default function SessionConnect({
     );
 
     unlisteners.push(
+      listen<MessagePayload>("session:disconnected", (event) => {
+        if (event.payload?.provider !== provider) return;
+        setStatus("idle");
+        setMessage(
+          `Not connected to ${displayName}. Reconnect to use your ${displayName} data.`
+        );
+      })
+    );
+
+    unlisteners.push(
       listen<DonePayload>("session:done", (event) => {
         if (event.payload?.provider !== provider) return;
         setStatus("done");
