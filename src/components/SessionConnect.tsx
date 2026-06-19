@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 interface ProgressPayload {
+  provider: string;
   stage: string;
   message: string;
   current: number | null;
@@ -10,19 +11,42 @@ interface ProgressPayload {
 }
 
 interface DonePayload {
+  provider: string;
   received?: number | null;
   sync_job_id?: string | null;
   items_sent?: number | null;
 }
 
+interface MessagePayload {
+  provider: string;
+  message: string;
+}
+
 type StatusKind = "idle" | "running" | "needs_login" | "done" | "error";
 
+interface SessionConnectProps {
+  /** Provider key registered in the Rust registry (e.g. "benchling", "labarchives"). */
+  provider: string;
+  /** Human-readable name shown in the UI. */
+  displayName: string;
+  /** Optional override for the description blurb. */
+  description?: string;
+}
+
 /**
- * Connect Benchling: opens benchling.com in a webview where the user logs in
- * with their own session, then imports their folders/entries/sequences into
- * Beakr. Listens to the `benchling:*` events emitted by the Rust side.
+ * Generic session connector UI. Opens the provider's site in a webview where the
+ * user logs in with their own session, then imports their data into Beakr.
+ *
+ * Drives the Rust `connect_session` / `session_import` commands with this
+ * component's `provider`, and listens to the generic `session:*` events, filtering
+ * to only those whose payload `provider` matches — so multiple connectors can be
+ * rendered side by side without cross-talk.
  */
-export default function BenchlingConnect() {
+export default function SessionConnect({
+  provider,
+  displayName,
+  description,
+}: SessionConnectProps) {
   const [status, setStatus] = useState<StatusKind>("idle");
   const [message, setMessage] = useState("");
   const [opened, setOpened] = useState(false);
@@ -31,7 +55,8 @@ export default function BenchlingConnect() {
     const unlisteners: Array<Promise<() => void>> = [];
 
     unlisteners.push(
-      listen<ProgressPayload>("benchling:progress", (event) => {
+      listen<ProgressPayload>("session:progress", (event) => {
+        if (event.payload?.provider !== provider) return;
         const p = event.payload;
         setStatus("running");
         const counter =
@@ -41,17 +66,19 @@ export default function BenchlingConnect() {
     );
 
     unlisteners.push(
-      listen<{ message: string }>("benchling:needs_login", (event) => {
+      listen<MessagePayload>("session:needs_login", (event) => {
+        if (event.payload?.provider !== provider) return;
         setStatus("needs_login");
         setMessage(
           event.payload?.message ||
-            "Please log in to Benchling in the window, then click Import."
+            `Please log in to ${displayName} in the window, then click Import.`
         );
       })
     );
 
     unlisteners.push(
-      listen<DonePayload>("benchling:done", (event) => {
+      listen<DonePayload>("session:done", (event) => {
+        if (event.payload?.provider !== provider) return;
         setStatus("done");
         const sent = event.payload?.items_sent ?? event.payload?.received ?? 0;
         setMessage(`Imported ${sent} item${sent === 1 ? "" : "s"} into Beakr.`);
@@ -59,22 +86,23 @@ export default function BenchlingConnect() {
     );
 
     unlisteners.push(
-      listen<{ message: string }>("benchling:error", (event) => {
+      listen<MessagePayload>("session:error", (event) => {
+        if (event.payload?.provider !== provider) return;
         setStatus("error");
-        setMessage(event.payload?.message || "Benchling import failed.");
+        setMessage(event.payload?.message || `${displayName} import failed.`);
       })
     );
 
     return () => {
       unlisteners.forEach((u) => u.then((fn) => fn()));
     };
-  }, []);
+  }, [provider, displayName]);
 
   const handleConnect = async () => {
     setStatus("idle");
-    setMessage("Opening Benchling… log in there, then click Import.");
+    setMessage(`Opening ${displayName}… log in there, then click Import.`);
     try {
-      await invoke("connect_benchling");
+      await invoke("connect_session", { provider });
       setOpened(true);
     } catch (e) {
       setStatus("error");
@@ -86,7 +114,7 @@ export default function BenchlingConnect() {
     setStatus("running");
     setMessage("Starting import…");
     try {
-      await invoke("benchling_import");
+      await invoke("session_import", { provider });
     } catch (e) {
       setStatus("error");
       setMessage(String(e));
@@ -104,10 +132,14 @@ export default function BenchlingConnect() {
       ? "#3b82f6"
       : "#9ca3af";
 
+  const blurb =
+    description ??
+    `Connect your ${displayName} account to import your data into Beakr. You log in with your own ${displayName} session — Beakr never sees your password.`;
+
   return (
     <section style={{ marginTop: "1.5rem" }}>
       <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.75rem" }}>
-        Benchling
+        {displayName}
       </h2>
       <div
         style={{
@@ -125,9 +157,7 @@ export default function BenchlingConnect() {
             marginBottom: "0.75rem",
           }}
         >
-          Connect your Benchling account to import folders, entries, and sequences
-          into Beakr. You log in with your own Benchling session — Beakr never sees
-          your password.
+          {blurb}
         </p>
 
         <div style={{ display: "flex", gap: "0.5rem" }}>
@@ -143,7 +173,7 @@ export default function BenchlingConnect() {
               cursor: "pointer",
             }}
           >
-            Connect Benchling
+            Connect {displayName}
           </button>
           <button
             onClick={handleImport}

@@ -27,20 +27,21 @@
 //! needs_login so the user can re-authenticate.
 //!
 //! Data bridge: the script POSTs the gathered JSON to a localhost HTTP endpoint
-//! served by the Rust side (`http://127.0.0.1:<port>/benchling/ingest`). We do NOT
+//! served by the Rust side (`http://127.0.0.1:<port>/session/ingest`). We do NOT
 //! expose Tauri IPC to the remote benchling.com origin; the localhost listener
 //! responds with `Access-Control-Allow-Origin: *` so the page-context fetch
 //! succeeds. The `__BEAKR_BRIDGE_PORT__` token is substituted by Rust before
-//! injection (see `benchling::commands`).
-
-/// Placeholder token replaced by Rust with the localhost bridge port.
-pub const PORT_PLACEHOLDER: &str = "__BEAKR_BRIDGE_PORT__";
+//! injection (see `session::commands`).
+//!
+//! The gather LOGIC below is unchanged from the original Benchling connector; only
+//! the bridge path was generalized from `/benchling/ingest` to `/session/ingest`
+//! when the connector was made provider-generic.
 
 /// The raw gather script. Rust substitutes `PORT_PLACEHOLDER` before `webview.eval`.
 pub const BENCHLING_GATHER_SCRIPT: &str = r#####"
 (async function beakrBenchlingGather() {
   const BRIDGE_PORT = "__BEAKR_BRIDGE_PORT__";
-  const BRIDGE_URL = "http://127.0.0.1:" + BRIDGE_PORT + "/benchling/ingest";
+  const BRIDGE_URL = "http://127.0.0.1:" + BRIDGE_PORT + "/session/ingest";
   const API = "/1/api";
   // Cap very long sequence base strings so a genome-sized record can't bloat the
   // payload. The backend stores content to S3, but keep the bridge POST sane.

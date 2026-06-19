@@ -1,7 +1,7 @@
-mod benchling;
 mod commands;
 mod config;
 mod security;
+mod session;
 mod state;
 mod tools;
 mod tray;
@@ -139,8 +139,8 @@ pub fn run() {
             commands::get_stored_token,
             commands::clear_token,
             commands::get_ws_url,
-            benchling::commands::connect_benchling,
-            benchling::commands::benchling_import,
+            session::commands::connect_session,
+            session::commands::session_import,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

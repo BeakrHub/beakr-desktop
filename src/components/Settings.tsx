@@ -4,7 +4,7 @@ import BeakrLogo from "./BeakrLogo";
 import ConnectionStatus from "./ConnectionStatus";
 import ActivityFeed from "./ActivityFeed";
 import FolderPicker from "./FolderPicker";
-import BenchlingConnect from "./BenchlingConnect";
+import SessionConnect from "./SessionConnect";
 
 interface SettingsProps {
   onUnlink: () => void;
@@ -121,7 +121,8 @@ export default function Settings({ onUnlink }: SettingsProps) {
 
       <FolderPicker />
 
-      <BenchlingConnect />
+      <SessionConnect provider="benchling" displayName="Benchling" />
+      <SessionConnect provider="labarchives" displayName="LabArchives" />
     </div>
   );
 }

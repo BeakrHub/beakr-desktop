@@ -1,5 +1,19 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// A running per-provider session-capture localhost bridge.
+///
+/// One instance exists per open provider window. The `port` is substituted into
+/// the provider's gather script; triggering `shutdown` tears down only this
+/// provider's listener, leaving other providers' bridges untouched.
+#[derive(Clone)]
+pub struct SessionBridge {
+    /// Port of this provider's running localhost data bridge.
+    pub port: u16,
+    /// Notifies this provider's bridge listener to shut down.
+    pub shutdown: Arc<tokio::sync::Notify>,
+}
 
 /// Connection status for the WebSocket client.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -35,10 +49,9 @@ pub struct AppState {
     pub ws_shutdown: Arc<tokio::sync::Notify>,
     /// Notifies the WS client when scoped_folders are changed via the UI.
     pub folders_changed: Arc<tokio::sync::Notify>,
-    /// Port of the running Benchling localhost data bridge, if open.
-    pub benchling_bridge_port: Arc<RwLock<Option<u16>>>,
-    /// Notifies the Benchling bridge listener to shut down.
-    pub benchling_bridge_shutdown: Arc<tokio::sync::Notify>,
+    /// Running session-capture localhost bridges, keyed by provider key
+    /// (e.g. "benchling", "labarchives"). One entry per open provider window.
+    pub session_bridges: Arc<RwLock<HashMap<String, SessionBridge>>>,
 }
 
 impl AppState {
@@ -56,8 +69,7 @@ impl AppState {
             device_id: Arc::new(RwLock::new(None)),
             ws_shutdown: Arc::new(tokio::sync::Notify::new()),
             folders_changed: Arc::new(tokio::sync::Notify::new()),
-            benchling_bridge_port: Arc::new(RwLock::new(None)),
-            benchling_bridge_shutdown: Arc::new(tokio::sync::Notify::new()),
+            session_bridges: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }

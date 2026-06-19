@@ -1,19 +1,23 @@
-//! Localhost data bridge between the injected benchling.com gather script and the
-//! Rust app.
+//! Localhost data bridge between an injected provider gather script and the Rust
+//! app.
 //!
 //! Why a localhost HTTP listener (and not Tauri IPC):
-//! The gather script runs in the page context of the REMOTE benchling.com origin.
-//! Exposing Tauri's `invoke` IPC to a remote origin is a security hazard and is
-//! awkward to scope safely in Tauri v2. Instead we run a tiny HTTP/1.1 listener
-//! bound to 127.0.0.1 on an ephemeral port and respond with
-//! `Access-Control-Allow-Origin: *`, so a page-context `fetch` from any origin can
-//! POST to it. Rust HTTP/TCP is not gated by Tauri capabilities, so no extra
-//! permission is required for the listener itself.
+//! The gather script runs in the page context of a REMOTE provider origin (e.g.
+//! benchling.com, mynotebook.labarchives.com). Exposing Tauri's `invoke` IPC to a
+//! remote origin is a security hazard and is awkward to scope safely in Tauri v2.
+//! Instead we run a tiny HTTP/1.1 listener bound to 127.0.0.1 on an ephemeral port
+//! and respond with `Access-Control-Allow-Origin: *`, so a page-context `fetch`
+//! from any origin can POST to it. Rust HTTP/TCP is not gated by Tauri
+//! capabilities, so no extra permission is required for the listener itself.
 //!
 //! We deliberately use a hand-rolled HTTP/1.1 read over a tokio `TcpListener`
 //! rather than pulling in a new crate (e.g. tiny_http): tokio is already a
 //! full-feature dependency, the protocol surface we need is trivial (one POST +
 //! CORS preflight), and it integrates directly with the existing async runtime.
+//!
+//! The bridge is provider-agnostic: gather scripts POST to `/session/ingest` and
+//! the listener forwards whatever JSON arrives. One bridge instance runs per open
+//! provider window (port + shutdown tracked per provider in `AppState`).
 
 use std::sync::Arc;
 
@@ -37,7 +41,7 @@ pub enum BridgeMessage {
         #[serde(default)]
         total: Option<u64>,
     },
-    /// The Benchling session is idle/expired — the user must log in again.
+    /// The provider session is idle/expired — the user must log in again.
     NeedsLogin {
         #[serde(default)]
         message: String,
@@ -80,7 +84,7 @@ pub async fn start_bridge(
         loop {
             tokio::select! {
                 _ = shutdown.notified() => {
-                    log::info!("Benchling bridge listener shutting down");
+                    log::info!("Session bridge listener shutting down");
                     break;
                 }
                 accepted = listener.accept() => {
@@ -89,12 +93,12 @@ pub async fn start_bridge(
                             let tx = tx.clone();
                             tauri::async_runtime::spawn(async move {
                                 if let Err(e) = handle_conn(stream, tx).await {
-                                    log::warn!("Benchling bridge connection error: {e}");
+                                    log::warn!("Session bridge connection error: {e}");
                                 }
                             });
                         }
                         Err(e) => {
-                            log::warn!("Benchling bridge accept error: {e}");
+                            log::warn!("Session bridge accept error: {e}");
                             break;
                         }
                     }
@@ -186,7 +190,7 @@ async fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<BridgeMessage>) -> 
             write_response(&mut stream, 200, "{\"ok\":true}").await?;
         }
         Err(e) => {
-            log::warn!("Benchling bridge: bad JSON body: {e}");
+            log::warn!("Session bridge: bad JSON body: {e}");
             write_response(&mut stream, 400, "{\"error\":\"bad json\"}").await?;
         }
     }
@@ -227,17 +231,22 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> Resu
     Ok(())
 }
 
-/// Emits a frontend progress event for a [`BridgeMessage::Progress`].
+/// Emits a frontend `session:progress` event for a [`BridgeMessage::Progress`].
+///
+/// Every emitted payload carries the `provider` key so a `SessionConnect`
+/// component can filter to its own provider's events.
 pub fn emit_progress(
     app: &AppHandle,
+    provider: &str,
     stage: &str,
     message: &str,
     current: Option<u64>,
     total: Option<u64>,
 ) {
     let _ = app.emit(
-        "benchling:progress",
+        "session:progress",
         serde_json::json!({
+            "provider": provider,
             "stage": stage,
             "message": message,
             "current": current,
@@ -246,23 +255,27 @@ pub fn emit_progress(
     );
 }
 
-/// Emits the terminal "done" event.
-pub fn emit_done(app: &AppHandle, payload: serde_json::Value) {
-    let _ = app.emit("benchling:done", payload);
+/// Emits the terminal `session:done` event. `payload` must already be an object;
+/// the `provider` key is merged in.
+pub fn emit_done(app: &AppHandle, provider: &str, mut payload: serde_json::Value) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("provider".to_string(), serde_json::json!(provider));
+    }
+    let _ = app.emit("session:done", payload);
 }
 
-/// Emits the "needs login" event (idle/expired Benchling session).
-pub fn emit_needs_login(app: &AppHandle, message: &str) {
+/// Emits the `session:needs_login` event (idle/expired provider session).
+pub fn emit_needs_login(app: &AppHandle, provider: &str, message: &str) {
     let _ = app.emit(
-        "benchling:needs_login",
-        serde_json::json!({ "message": message }),
+        "session:needs_login",
+        serde_json::json!({ "provider": provider, "message": message }),
     );
 }
 
-/// Emits a terminal error event.
-pub fn emit_error(app: &AppHandle, message: &str) {
+/// Emits a terminal `session:error` event.
+pub fn emit_error(app: &AppHandle, provider: &str, message: &str) {
     let _ = app.emit(
-        "benchling:error",
-        serde_json::json!({ "message": message }),
+        "session:error",
+        serde_json::json!({ "provider": provider, "message": message }),
     );
 }

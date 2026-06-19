@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "session-connectors",
+  "description": "Minimal capability for the remote session-connector import windows (one per provider, labeled session-<provider>). Each page-context gather script talks to the Rust app only via a localhost HTTP bridge (plain fetch), so these remote origins are granted NO Beakr IPC commands or events. List every registered provider origin under remote.urls.",
+  "windows": ["session-*"],
+  "remote": {
+    "urls": [
+      "https://benchling.com/*",
+      "https://*.benchling.com/*",
+      "https://mynotebook.labarchives.com/*",
+      "https://*.labarchives.com/*"
+    ]
+  },
+  "permissions": []
+}
