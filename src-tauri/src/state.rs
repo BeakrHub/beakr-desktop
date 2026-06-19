@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -47,6 +48,13 @@ pub struct AppState {
     pub device_name: Arc<RwLock<String>>,
     pub device_id: Arc<RwLock<Option<String>>>,
     pub ws_shutdown: Arc<tokio::sync::Notify>,
+    /// Set to true when the user explicitly disconnects, so the WS run loop stops
+    /// reconnecting. A lone `ws_shutdown` notify permit can be consumed by the
+    /// message loop before the run loop checks it, so this flag — not the notify —
+    /// is the durable source of truth for "the user asked to stay disconnected."
+    /// Cleared on the next connect. Distinguishes a deliberate disconnect (stay
+    /// down) from a dropped socket (auto-reconnect).
+    pub shutdown_requested: Arc<AtomicBool>,
     /// Notifies the WS client when scoped_folders are changed via the UI.
     pub folders_changed: Arc<tokio::sync::Notify>,
     /// Running session-capture localhost bridges, keyed by provider key
@@ -68,6 +76,7 @@ impl AppState {
             device_name: Arc::new(RwLock::new(device_name)),
             device_id: Arc::new(RwLock::new(None)),
             ws_shutdown: Arc::new(tokio::sync::Notify::new()),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             folders_changed: Arc::new(tokio::sync::Notify::new()),
             session_bridges: Arc::new(RwLock::new(HashMap::new())),
         }

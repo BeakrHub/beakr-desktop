@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use tauri::{AppHandle, State};
 use tauri_plugin_store::StoreExt;
 
@@ -24,6 +26,9 @@ pub async fn connect_ws(app: AppHandle, state: State<'_, AppState>) -> Result<()
 
     let ws_url = crate::ws_url();
 
+    // Clear any prior disconnect request so the run loop will stay connected.
+    state.shutdown_requested.store(false, Ordering::SeqCst);
+
     let state_clone = (*state).clone();
     let app_clone = app.clone();
 
@@ -38,6 +43,10 @@ pub async fn connect_ws(app: AppHandle, state: State<'_, AppState>) -> Result<()
 /// Disconnect the WebSocket.
 #[tauri::command]
 pub async fn disconnect_ws(state: State<'_, AppState>) -> Result<(), String> {
+    // Record the intent durably before notifying: the message loop may consume the
+    // notify permit and tear down the socket before the run loop re-checks, so the
+    // flag — not the permit — is what keeps it from auto-reconnecting.
+    state.shutdown_requested.store(true, Ordering::SeqCst);
     state.ws_shutdown.notify_one();
     Ok(())
 }
@@ -205,6 +214,30 @@ pub async fn claim_pairing_code(
     // Set token in runtime state for immediate WS connection
     *state.auth_token.write().await = Some(device_token.to_string());
 
+    // Device is now paired — reflect that in the tray menu label.
+    crate::tray::update_tray_pairing(&app, true);
+
+    // NOTE: we deliberately do NOT force a reconnect here, and that is correct
+    // for production. Pairing is reached from the PairingScreen, which only shows
+    // when there is no token and (in a release build) no live connection — so the
+    // frontend's subsequent connect_ws() is a clean first connect using the token
+    // just stored above.
+    //
+    // The one place this is imperfect is the DEV build: it auto-connects as a
+    // throwaway `dev_local` device on startup (see lib.rs, gated on
+    // debug_assertions), so a live "ghost" connection already exists when you
+    // pair. connect_ws() no-ops while already connected, so the new token does not
+    // take over until that ghost connection drops (heartbeat timeout, ~90s) or the
+    // user toggles Disconnect -> Connect. This is a dev-only ergonomic quirk, not a
+    // production bug, so it is intentionally left as-is.
+    //
+    // Do NOT "fix" this by calling disconnect_ws() then connect_ws() here: that can
+    // leave the old run() loop racing the `shutdown_requested` flag and spawn a
+    // second concurrent reconnect loop — the exact reconnect-race class ENG-758
+    // stabilized. If a real "switch account while connected" flow is ever needed,
+    // do it as a single-loop reconnect SIGNAL (a force_reconnect Notify handled
+    // inside the existing message loop), never as disconnect-then-reconnect.
+
     Ok(())
 }
 
@@ -220,9 +253,13 @@ pub fn get_stored_token(app: AppHandle) -> Result<Option<String>, String> {
         .and_then(|v| serde_json::from_value(v).ok()))
 }
 
-/// Clear stored device token (unlink device).
-#[tauri::command]
-pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+/// Unlink the device: drop the runtime token, delete it from the persistent
+/// store, and flip the tray label back to "Pair device". Shared by the
+/// `clear_token` command (user-initiated "Unlink Device") and the WS client's
+/// revocation path, which must unlink authoritatively in Rust because the app
+/// runs as a menu-bar accessory with no webview alive at startup to handle the
+/// `token_invalid` event.
+pub(crate) async fn clear_device_token(app: &AppHandle, state: &AppState) -> Result<(), String> {
     // Clear runtime state
     *state.auth_token.write().await = None;
 
@@ -232,7 +269,16 @@ pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(
         .map_err(|e| format!("Failed to open store: {e}"))?;
     let _ = store.delete("device_token");
 
+    // Device is no longer paired — reflect that in the tray menu label.
+    crate::tray::update_tray_pairing(app, false);
+
     Ok(())
+}
+
+/// Clear stored device token (unlink device).
+#[tauri::command]
+pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    clear_device_token(&app, &state).await
 }
 
 fn store_token(app: &AppHandle, token: &str) -> Result<(), String> {

@@ -2,20 +2,43 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
+// Shown once, before the user grants the very first folder, so it is clear that
+// Beakr reads file contents (the deny-list only blocks secret-looking filenames,
+// not secrets written inside otherwise-ordinary files). Persisted so it never
+// nags again after it has been acknowledged.
+const ACCESS_NOTE_ACK_KEY = "beakr-folder-access-acknowledged";
+
 export default function FolderPicker() {
   const [folders, setFolders] = useState<string[]>([]);
+  const [showAccessNote, setShowAccessNote] = useState(false);
 
   useEffect(() => {
     invoke<string[]>("get_scoped_folders").then(setFolders);
   }, []);
 
-  const addFolder = async () => {
+  // Open the native picker and persist the new folder. Separated from the click
+  // handler so the one-time note can gate the first call without duplicating it.
+  const pickAndAddFolder = async () => {
     const selected = await open({ directory: true, multiple: false });
     if (selected && typeof selected === "string") {
       const updated = [...folders, selected];
       setFolders(updated);
       await invoke("set_scoped_folders", { folders: updated });
     }
+  };
+
+  const handleAddFolderClick = async () => {
+    if (!localStorage.getItem(ACCESS_NOTE_ACK_KEY)) {
+      setShowAccessNote(true);
+      return;
+    }
+    await pickAndAddFolder();
+  };
+
+  const acknowledgeAndAdd = async () => {
+    localStorage.setItem(ACCESS_NOTE_ACK_KEY, "1");
+    setShowAccessNote(false);
+    await pickAndAddFolder();
   };
 
   const removeFolder = async (index: number) => {
@@ -38,7 +61,7 @@ export default function FolderPicker() {
           Allowed Folders
         </h2>
         <button
-          onClick={addFolder}
+          onClick={handleAddFolderClick}
           style={{
             fontSize: "0.8rem",
             padding: "0.25rem 0.75rem",
@@ -114,6 +137,89 @@ export default function FolderPicker() {
             </li>
           ))}
         </ul>
+      )}
+
+      {showAccessNote && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="folder-access-note-title"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0, 0, 0, 0.35)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "1.5rem",
+            zIndex: 1000,
+          }}
+        >
+          <div
+            style={{
+              background: "white",
+              borderRadius: 12,
+              padding: "1.25rem 1.25rem 1rem",
+              maxWidth: 360,
+              width: "100%",
+              boxShadow: "0 12px 32px rgba(0, 0, 0, 0.18)",
+            }}
+          >
+            <h3
+              id="folder-access-note-title"
+              style={{ margin: "0 0 0.5rem", fontSize: "1rem", fontWeight: 600 }}
+            >
+              Before you add a folder
+            </h3>
+            <p
+              style={{
+                margin: "0 0 1rem",
+                fontSize: "0.85rem",
+                lineHeight: 1.5,
+                color: "#444",
+              }}
+            >
+              Beakr can read any file inside the folders you add, including files
+              that contain passwords, API keys, or other secrets. Only add folders
+              you are comfortable letting the AI read.
+            </p>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "flex-end",
+                gap: "0.5rem",
+              }}
+            >
+              <button
+                onClick={() => setShowAccessNote(false)}
+                style={{
+                  fontSize: "0.8rem",
+                  padding: "0.35rem 0.85rem",
+                  border: "1px solid #ddd",
+                  borderRadius: 6,
+                  background: "white",
+                  cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={acknowledgeAndAdd}
+                style={{
+                  fontSize: "0.8rem",
+                  padding: "0.35rem 0.85rem",
+                  border: "1px solid #2563eb",
+                  borderRadius: 6,
+                  background: "#2563eb",
+                  color: "white",
+                  cursor: "pointer",
+                }}
+              >
+                Choose folder
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </section>
   );
