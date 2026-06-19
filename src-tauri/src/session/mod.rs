@@ -1,25 +1,19 @@
-//! Generic "session connector": import data from login-walled websites.
+//! Live "session connector": capture a user's logged-in browser session.
 //!
 //! A session connector opens a provider's site in a Tauri webview where the user
-//! logs in with their OWN browser session, then runs a page-context "gather
-//! script" that reads data via the site's own (cookie-authenticated) endpoints and
-//! POSTs it to a localhost bridge, which uploads it to the Beakr backend using the
-//! stored device token. This works even when a provider's official API is not
-//! available to the user's plan (the original Benchling case: `/api/v2` is gated to
-//! paid tiers, so the connector uses Benchling's internal `/1/api/*`).
+//! logs in with their OWN browser session. We then capture the session cookie and
+//! use it to call the provider's own (cookie-authenticated) endpoints directly
+//! from Rust. This works even when a provider's official API is not available to
+//! the user's plan (the original Benchling case: `/api/v2` is gated to paid tiers,
+//! so the live tools use Benchling's internal `/1/api/*`).
 //!
-//! The pieces are provider-agnostic:
-//!   - `registry`: maps a provider key -> { url, gather_script }. Adding a provider
-//!     is one registry arm + one gather script.
-//!   - `scripts`: the injected page-context gather scripts (one module per
-//!     provider). All follow the same data contract (see `scripts::benchling`).
-//!   - `bridge`: the localhost HTTP listener that receives the gathered JSON and
-//!     emits generic `session:*` frontend events (each carrying `provider`).
-//!   - `commands`: the Tauri commands (`connect_session`, `session_import`) and the
-//!     import driver that pushes items to the backend.
+//! The pieces:
+//!   - `registry`: maps a provider key -> { url, window-label } for the webview to
+//!     open. Provider-agnostic.
+//!   - `benchling`: the Benchling connect flow (login watch, session capture,
+//!     connector registration, liveness watcher).
+//!   - `commands`: the Tauri commands (`connect_session`, `benchling_status`).
 
 pub mod benchling;
-pub mod bridge;
 pub mod commands;
 pub mod registry;
-pub mod scripts;
