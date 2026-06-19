@@ -80,8 +80,10 @@ pub fn run() {
                 }
             }
 
-            // Set up system tray
+            // Set up system tray, then set the pairing-aware menu label from the
+            // stored token (claim_pairing_code / clear_token keep it in sync after).
             tray::setup_tray(app.handle())?;
+            tray::update_tray_pairing(app.handle(), has_stored_token);
 
             // Auto-connect if we have a stored device token
             // (In dev mode without a token, the frontend will handle connection)

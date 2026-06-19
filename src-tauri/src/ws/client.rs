@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -48,6 +49,17 @@ impl WsClient {
                     if close_code == Some(CLOSE_REVOKED) {
                         log::warn!("Device revoked by server");
                         self.set_status(ConnectionStatus::Revoked).await;
+                        // Unlink authoritatively in Rust: a revoked device can be
+                        // revoked-at-startup (the app is a menu-bar accessory with
+                        // no webview yet), so we can't rely on the frontend's
+                        // token_invalid listener to clear the token + flip the tray.
+                        if let Err(e) =
+                            crate::commands::clear_device_token(&self.app, &self.state).await
+                        {
+                            log::error!("Failed to clear device token after revocation: {e}");
+                        }
+                        // Also notify the frontend (when a window is open) so it
+                        // routes to the PairingScreen instead of the paired view.
                         let _ = self.app.emit("token_invalid", ());
                         return;
                     }
@@ -66,8 +78,8 @@ impl WsClient {
                 }
             }
 
-            // Check if shutdown was requested
-            if self.is_shutdown_requested().await {
+            // Stop reconnecting if the user explicitly disconnected.
+            if self.state.shutdown_requested.load(Ordering::SeqCst) {
                 self.set_status(ConnectionStatus::Disconnected).await;
                 return;
             }
@@ -87,10 +99,13 @@ impl WsClient {
 
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
-                _ = self.state.ws_shutdown.notified() => {
-                    self.set_status(ConnectionStatus::Disconnected).await;
-                    return;
-                }
+                _ = self.state.ws_shutdown.notified() => {}
+            }
+
+            // Re-check after waking: a disconnect during backoff should stop here.
+            if self.state.shutdown_requested.load(Ordering::SeqCst) {
+                self.set_status(ConnectionStatus::Disconnected).await;
+                return;
             }
 
             // Brief wait for token to arrive
@@ -105,7 +120,7 @@ impl WsClient {
         // Build request — use subprotocol auth in production, query params in dev
         let user_agent = format!("BeakrDesktop/{}", env!("CARGO_PKG_VERSION"));
 
-        let (ws_stream, _response) = if let Some(token) = token {
+        let connect_result = if let Some(token) = token {
             let mut request = self.ws_url.as_str().into_client_request()?;
             let subprotocol = format!("beakr-v1, bearer.{token}");
             request.headers_mut().insert(
@@ -116,7 +131,7 @@ impl WsClient {
                 "User-Agent",
                 HeaderValue::from_str(&user_agent)?,
             );
-            tokio_tungstenite::connect_async(request).await?
+            tokio_tungstenite::connect_async(request).await
         } else if cfg!(debug_assertions) {
             // Dev mode: use query params for auth (matches backend dev bypass)
             let dev_url = format!(
@@ -128,9 +143,26 @@ impl WsClient {
                 "User-Agent",
                 HeaderValue::from_str(&user_agent)?,
             );
-            tokio_tungstenite::connect_async(request).await?
+            tokio_tungstenite::connect_async(request).await
         } else {
             return Err("No auth token available".into());
+        };
+
+        let (ws_stream, _response) = match connect_result {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A 403 at the HTTP handshake is the engine rejecting this device
+                // token outright ("Invalid or revoked device token"). It happens
+                // *before* the WS upgrade, so it never arrives as a 4010 close
+                // frame — without this it falls through to the generic reconnect
+                // backoff and loops forever. Map it to the same terminal-revoked
+                // path as 4010: stop reconnecting, mark Revoked, emit token_invalid.
+                if is_revoked_handshake(&e) {
+                    log::warn!("Handshake rejected with 403 Forbidden — device token revoked");
+                    return Ok(Some(CLOSE_REVOKED));
+                }
+                return Err(e.into());
+            }
         };
         let (mut write, mut read) = ws_stream.split();
 
@@ -241,8 +273,13 @@ impl WsClient {
                 }
 
                 _ = self.state.ws_shutdown.notified() => {
-                    let _ = write.send(Message::Close(None)).await;
-                    return None;
+                    // Only tear down on a real, user-requested disconnect. A stray
+                    // notify permit left over from a previous disconnect must not
+                    // close a freshly re-established connection.
+                    if self.state.shutdown_requested.load(Ordering::SeqCst) {
+                        let _ = write.send(Message::Close(None)).await;
+                        return None;
+                    }
                 }
             }
         }
@@ -323,13 +360,16 @@ impl WsClient {
         let _ = self.app.emit("ws:status_changed", status_str);
     }
 
-    async fn is_shutdown_requested(&self) -> bool {
-        // Check if the notify has been triggered by trying with zero timeout
-        tokio::select! {
-            _ = self.state.ws_shutdown.notified() => true,
-            _ = tokio::time::sleep(Duration::ZERO) => false,
-        }
-    }
+}
+
+/// True when a connect error is a 403 Forbidden returned at the HTTP handshake —
+/// the engine's signal that the device token is invalid or revoked. This is
+/// distinct from a transient network failure: a 403 will never succeed on retry,
+/// so it's treated as terminal-revoked rather than backed off.
+fn is_revoked_handshake(err: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::http::StatusCode;
+    use tokio_tungstenite::tungstenite::Error;
+    matches!(err, Error::Http(response) if response.status() == StatusCode::FORBIDDEN)
 }
 
 fn current_platform() -> &'static str {
@@ -366,5 +406,39 @@ pub fn os_version() -> String {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "unknown".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
+    use tokio_tungstenite::tungstenite::Error;
+
+    fn http_error(status: StatusCode) -> Error {
+        let body: Option<Vec<u8>> = None;
+        Error::Http(Response::builder().status(status).body(body).unwrap())
+    }
+
+    #[test]
+    fn forbidden_handshake_is_terminal_revoked() {
+        // Regression: the engine rejects a revoked/invalid device token with a
+        // 403 at the HTTP handshake (pre-WS-upgrade, so never a 4010 close).
+        // It must be classified terminal so run() stops instead of looping forever.
+        assert!(is_revoked_handshake(&http_error(StatusCode::FORBIDDEN)));
+    }
+
+    #[test]
+    fn other_http_statuses_are_not_revoked() {
+        // 401/500 are not the revoke signal — they must stay retryable, not
+        // collapse into a permanent unlink.
+        assert!(!is_revoked_handshake(&http_error(StatusCode::UNAUTHORIZED)));
+        assert!(!is_revoked_handshake(&http_error(StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    #[test]
+    fn transient_connection_errors_are_not_revoked() {
+        // A dropped socket must remain retryable (backoff), not terminal-revoked.
+        assert!(!is_revoked_handshake(&Error::ConnectionClosed));
     }
 }
