@@ -27,11 +27,15 @@ jobs:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          # Use tag name to pick env file (detached HEAD can't resolve branches)
+          # Use tag name to pick env file (detached HEAD can't resolve branches).
+          # Sandbox tags publish as prereleases so the production updater feed
+          # (releases/latest) never serves a sandbox build to real users.
           if [[ "$TAG_NAME" == *"sandbox"* ]]; then
             echo "env_file=.env.sandbox" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
           else
             echo "env_file=.env.production" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Load environment variables
@@ -67,12 +71,14 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Beakr Desktop ${{ github.ref_name }}"
           releaseBody: "Desktop agent release ${{ github.ref_name }}"
           releaseDraft: false
-          prerelease: false
+          prerelease: ${{ steps.env.outputs.prerelease }}
           args: --target ${{ matrix.target }}
 
   build-windows:
@@ -89,8 +95,10 @@ jobs:
         run: |
           if [[ "$TAG_NAME" == *"sandbox"* ]]; then
             echo "env_file=.env.sandbox" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
           else
             echo "env_file=.env.production" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Load environment variables
@@ -121,10 +129,12 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Beakr Desktop ${{ github.ref_name }}"
           releaseBody: "Desktop agent release ${{ github.ref_name }}"
           releaseDraft: false
-          prerelease: false
+          prerelease: ${{ steps.env.outputs.prerelease }}
           args: --target x86_64-pc-windows-msvc

@@ -235,35 +235,45 @@ async fn report_disconnect(token: &str) {
 /// disconnect to the backend. Transient network errors are ignored so a blip
 /// does not produce a false disconnect.
 pub async fn watch_session_liveness(app: AppHandle, state: AppState) {
-    let mut was_live = false;
+    // Whether the current "dead" period still needs a disconnect reported. Starts
+    // true so a fresh launch with NO captured session (e.g. after quit -> reopen,
+    // where the in-memory session is gone but the backend connector may still read
+    // "healthy" and the device is back online) reports once and the web reflects
+    // "not connected".
+    let mut needs_report = true;
+    // Check immediately on startup, then once per interval.
     loop {
-        tokio::time::sleep(LIVENESS_INTERVAL).await;
-
         let session = { state.benchling_session.read().await.clone() };
         match session {
             None => {
-                if was_live {
-                    // A tool call cleared the session on a 401 — surface it now.
-                    crate::session::bridge::emit_disconnected(&app, "benchling");
+                // No live session. Report once; retry next tick if the device
+                // token has not been loaded into state yet.
+                if needs_report {
                     if let Some(token) = state.auth_token.read().await.clone() {
+                        crate::session::bridge::emit_disconnected(&app, "benchling");
                         report_disconnect(&token).await;
+                        needs_report = false;
                     }
-                    was_live = false;
                 }
             }
             Some(sess) => match probe_users_me(&sess.session_cookie).await {
-                Ok(Some(_)) => was_live = true,
+                // Live — re-arm so a later death/quit is reported again.
+                Ok(Some(_)) => needs_report = true,
                 Ok(None) => {
                     // 401 — the session expired or the user logged out.
                     *state.benchling_session.write().await = None;
-                    crate::session::bridge::emit_disconnected(&app, "benchling");
-                    if let Some(token) = state.auth_token.read().await.clone() {
-                        report_disconnect(&token).await;
+                    if needs_report {
+                        crate::session::bridge::emit_disconnected(&app, "benchling");
+                        if let Some(token) = state.auth_token.read().await.clone() {
+                            report_disconnect(&token).await;
+                        }
+                        needs_report = false;
                     }
-                    was_live = false;
                 }
                 Err(_) => { /* transient error — leave the session intact */ }
             },
         }
+
+        tokio::time::sleep(LIVENESS_INTERVAL).await;
     }
 }
