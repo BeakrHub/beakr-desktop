@@ -158,7 +158,39 @@ async fn api_get(state: &AppState, sess: &BenchlingSession, path: &str) -> Resul
         .text()
         .await
         .map_err(|e| format!("Failed to read Benchling response: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("Invalid Benchling JSON for {path}: {e}"))
+    let mut json: Value =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid Benchling JSON for {path}: {e}"))?;
+    // Benchling's /1/api returns RELATIVE URL paths (e.g. "/mstrome/f_/...").
+    // Rewrite them to absolute https://<tenant_host>/... so links resolve to
+    // Benchling, not the Beakr app origin that renders the tool result (which
+    // would be localhost in dev and the Beakr domain in prod).
+    absolutize_urls(&mut json, &sess.tenant_host);
+    Ok(json)
+}
+
+/// Recursively rewrites Benchling's relative URL fields (`url`, `editURL`,
+/// `webURL`, `owner_url`) to absolute `https://<host>/...`, stripping a trailing
+/// `/edit` so links open the view (not the editor). Absolute values (e.g.
+/// `avatar_url` on a CDN) are left untouched since they do not start with `/`.
+fn absolutize_urls(value: &mut Value, host: &str) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if matches!(k.as_str(), "url" | "editURL" | "webURL" | "owner_url") {
+                    if let Value::String(s) = v {
+                        if s.starts_with('/') {
+                            let path = s.strip_suffix("/edit").unwrap_or(s).to_string();
+                            *s = format!("https://{host}{path}");
+                        }
+                        continue;
+                    }
+                }
+                absolutize_urls(v, host);
+            }
+        }
+        Value::Array(arr) => arr.iter_mut().for_each(|i| absolutize_urls(i, host)),
+        _ => {}
+    }
 }
 
 // ---- shared listing helpers ------------------------------------------------
