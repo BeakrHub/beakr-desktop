@@ -3,8 +3,8 @@
 //!
 //! Why a localhost HTTP listener (and not Tauri IPC):
 //! The gather script runs in the page context of a REMOTE provider origin (e.g.
-//! benchling.com, mynotebook.labarchives.com). Exposing Tauri's `invoke` IPC to a
-//! remote origin is a security hazard and is awkward to scope safely in Tauri v2.
+//! benchling.com). Exposing Tauri's `invoke` IPC to a remote origin is a security
+//! hazard and is awkward to scope safely in Tauri v2.
 //! Instead we run a tiny HTTP/1.1 listener bound to 127.0.0.1 on an ephemeral port
 //! and respond with `Access-Control-Allow-Origin: *`, so a page-context `fetch`
 //! from any origin can POST to it. Rust HTTP/TCP is not gated by Tauri

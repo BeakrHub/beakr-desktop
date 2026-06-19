@@ -310,7 +310,8 @@ impl WsClient {
                     "params": &params,
                 }));
 
-                let response = tools::dispatch_request(&tool, params, &scoped_folders).await;
+                let response =
+                    tools::dispatch_request(&tool, params, &scoped_folders, &self.state).await;
 
                 let (outgoing, result_status) = match response {
                     Ok((data, bytes)) => (OutgoingMessage::Response {

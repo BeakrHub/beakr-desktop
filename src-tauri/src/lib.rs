@@ -86,6 +86,12 @@ pub fn run() {
             tray::setup_tray(app.handle())?;
             tray::update_tray_pairing(app.handle(), has_stored_token);
 
+            // In dev builds, auto-open the window on launch so testing does not
+            // depend on finding the tray icon. This app is an Accessory app (no
+            // Dock icon), and a full/notched menu bar can hide the tray icon.
+            #[cfg(debug_assertions)]
+            tray::show_settings_window(app.handle());
+
             // Auto-connect if we have a stored device token
             // (In dev mode without a token, the frontend will handle connection)
             if has_stored_token {
@@ -143,6 +149,7 @@ pub fn run() {
             commands::get_ws_url,
             session::commands::connect_session,
             session::commands::session_import,
+            session::commands::benchling_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

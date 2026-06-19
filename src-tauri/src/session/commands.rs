@@ -100,6 +100,21 @@ pub async fn connect_session(
         .build()
         .map_err(|e| format!("Failed to open session window: {e}"))?;
 
+    // For Benchling, start watching for login so we can capture the session cookie,
+    // register the free connector with the backend, and emit `session:connected`
+    // once the user has logged in. This is what makes the live `benchling_*` agent
+    // tools work (see `session::benchling` and `tools::benchling`). Other steps of
+    // the legacy import flow (gather script + bridge) remain available but are no
+    // longer exposed in the UI.
+    if provider == "benchling" {
+        let app_watch = app.clone();
+        let state_watch = (*state).clone();
+        let label = window_label.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::session::benchling::watch_for_login(app_watch, state_watch, label).await;
+        });
+    }
+
     // Clear the cached bridge entry when the window is closed so a later connect
     // starts fresh.
     {
@@ -125,9 +140,13 @@ pub async fn connect_session(
 
 /// Injects a provider's gather script into its open session window.
 ///
-/// Called by the frontend "Import" button after the user has logged in. The
-/// gather script verifies the session, lists items, and POSTs them to the
-/// localhost bridge (which the driver started in `connect_session` consumes).
+/// This drives the legacy one-shot wiki-import flow: the gather script verifies
+/// the session, lists items, and POSTs them to the localhost bridge (which the
+/// driver started in `connect_session` consumes). It is INTENTIONALLY no longer
+/// exposed in the UI — the Benchling connector now exposes live agent tools
+/// instead of a bulk import (see `session::benchling` / `tools::benchling`). The
+/// command, gather script, and bridge are kept in the codebase so the import path
+/// can be re-enabled without rebuilding it.
 #[tauri::command]
 pub async fn session_import(
     provider: String,
@@ -160,6 +179,27 @@ pub async fn session_import(
 
     bridge::emit_progress(&app, &provider, "start", "Starting import…", None, None);
     Ok(())
+}
+
+/// Returns the current Benchling connection status so the UI can reflect
+/// "Connected" after a reload (the `session:connected` event only fires once, at
+/// connect time). `null` when no session has been captured.
+#[tauri::command]
+pub async fn benchling_status(
+    state: State<'_, AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    Ok(state
+        .benchling_session
+        .read()
+        .await
+        .as_ref()
+        .map(|s| {
+            serde_json::json!({
+                "connected": true,
+                "user_handle": s.user_handle,
+                "tenant_host": s.tenant_host,
+            })
+        }))
 }
 
 /// Consumes bridge messages until a terminal message arrives, emitting frontend

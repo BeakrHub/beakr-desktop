@@ -18,6 +18,7 @@
 //!   - `commands`: the Tauri commands (`connect_session`, `session_import`) and the
 //!     import driver that pushes items to the backend.
 
+pub mod benchling;
 pub mod bridge;
 pub mod commands;
 pub mod registry;

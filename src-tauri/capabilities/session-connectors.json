@@ -6,9 +6,7 @@
   "remote": {
     "urls": [
       "https://benchling.com/*",
-      "https://*.benchling.com/*",
-      "https://mynotebook.labarchives.com/*",
-      "https://*.labarchives.com/*"
+      "https://*.benchling.com/*"
     ]
   },
   "permissions": []

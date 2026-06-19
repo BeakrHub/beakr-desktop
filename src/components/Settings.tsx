@@ -122,7 +122,6 @@ export default function Settings({ onUnlink }: SettingsProps) {
       <FolderPicker />
 
       <SessionConnect provider="benchling" displayName="Benchling" />
-      <SessionConnect provider="labarchives" displayName="LabArchives" />
     </div>
   );
 }

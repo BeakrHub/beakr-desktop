@@ -22,10 +22,23 @@ interface MessagePayload {
   message: string;
 }
 
-type StatusKind = "idle" | "running" | "needs_login" | "done" | "error";
+interface ConnectedPayload {
+  provider: string;
+  user_handle?: string | null;
+  tenant_host?: string | null;
+}
+
+type StatusKind =
+  | "idle"
+  | "connecting"
+  | "running"
+  | "needs_login"
+  | "connected"
+  | "done"
+  | "error";
 
 interface SessionConnectProps {
-  /** Provider key registered in the Rust registry (e.g. "benchling", "labarchives"). */
+  /** Provider key registered in the Rust registry (e.g. "benchling"). */
   provider: string;
   /** Human-readable name shown in the UI. */
   displayName: string;
@@ -35,12 +48,14 @@ interface SessionConnectProps {
 
 /**
  * Generic session connector UI. Opens the provider's site in a webview where the
- * user logs in with their own session, then imports their data into Beakr.
+ * user logs in with their own session. Once login is detected, the Rust side
+ * captures the session and registers the provider's live agent tools with the
+ * Beakr backend (see `session::benchling`), emitting `session:connected`.
  *
- * Drives the Rust `connect_session` / `session_import` commands with this
- * component's `provider`, and listens to the generic `session:*` events, filtering
- * to only those whose payload `provider` matches — so multiple connectors can be
- * rendered side by side without cross-talk.
+ * Drives the Rust `connect_session` command with this component's `provider`, and
+ * listens to the generic `session:*` events, filtering to only those whose payload
+ * `provider` matches — so multiple connectors can be rendered side by side without
+ * cross-talk.
  */
 export default function SessionConnect({
   provider,
@@ -49,9 +64,26 @@ export default function SessionConnect({
 }: SessionConnectProps) {
   const [status, setStatus] = useState<StatusKind>("idle");
   const [message, setMessage] = useState("");
-  const [opened, setOpened] = useState(false);
 
   useEffect(() => {
+    // Reflect an already-connected session on mount (the `session:connected`
+    // event only fires once at connect time, so a reload would otherwise show
+    // "idle"). Only Benchling exposes a live status today.
+    if (provider === "benchling") {
+      invoke<{ user_handle?: string | null } | null>("benchling_status")
+        .then((s) => {
+          if (!s) return;
+          setStatus("connected");
+          const who = s.user_handle ? ` as ${s.user_handle}` : "";
+          setMessage(
+            `Connected to ${displayName}${who}. Beakr can now use your ${displayName} data.`
+          );
+        })
+        .catch(() => {
+          /* no status command for this provider — leave idle */
+        });
+    }
+
     const unlisteners: Array<Promise<() => void>> = [];
 
     unlisteners.push(
@@ -71,7 +103,20 @@ export default function SessionConnect({
         setStatus("needs_login");
         setMessage(
           event.payload?.message ||
-            `Please log in to ${displayName} in the window, then click Import.`
+            `Please log in to ${displayName} in the window.`
+        );
+      })
+    );
+
+    unlisteners.push(
+      listen<ConnectedPayload>("session:connected", (event) => {
+        if (event.payload?.provider !== provider) return;
+        setStatus("connected");
+        const who = event.payload?.user_handle
+          ? ` as ${event.payload.user_handle}`
+          : "";
+        setMessage(
+          `Connected to ${displayName}${who}. Beakr can now use your ${displayName} data.`
         );
       })
     );
@@ -89,7 +134,7 @@ export default function SessionConnect({
       listen<MessagePayload>("session:error", (event) => {
         if (event.payload?.provider !== provider) return;
         setStatus("error");
-        setMessage(event.payload?.message || `${displayName} import failed.`);
+        setMessage(event.payload?.message || `${displayName} connection failed.`);
       })
     );
 
@@ -99,22 +144,10 @@ export default function SessionConnect({
   }, [provider, displayName]);
 
   const handleConnect = async () => {
-    setStatus("idle");
-    setMessage(`Opening ${displayName}… log in there, then click Import.`);
+    setStatus("connecting");
+    setMessage(`Opening ${displayName}… log in there to connect.`);
     try {
       await invoke("connect_session", { provider });
-      setOpened(true);
-    } catch (e) {
-      setStatus("error");
-      setMessage(String(e));
-    }
-  };
-
-  const handleImport = async () => {
-    setStatus("running");
-    setMessage("Starting import…");
-    try {
-      await invoke("session_import", { provider });
     } catch (e) {
       setStatus("error");
       setMessage(String(e));
@@ -122,19 +155,19 @@ export default function SessionConnect({
   };
 
   const dotColor =
-    status === "done"
+    status === "connected" || status === "done"
       ? "#22c55e"
       : status === "error"
       ? "#ef4444"
       : status === "needs_login"
       ? "#f59e0b"
-      : status === "running"
+      : status === "running" || status === "connecting"
       ? "#3b82f6"
       : "#9ca3af";
 
   const blurb =
     description ??
-    `Connect your ${displayName} account to import your data into Beakr. You log in with your own ${displayName} session — Beakr never sees your password.`;
+    `Connect your ${displayName} account so Beakr can read your ${displayName} data on demand. You log in with your own ${displayName} session — Beakr never sees your password.`;
 
   return (
     <section style={{ marginTop: "1.5rem" }}>
@@ -174,21 +207,6 @@ export default function SessionConnect({
             }}
           >
             Connect {displayName}
-          </button>
-          <button
-            onClick={handleImport}
-            disabled={!opened}
-            style={{
-              fontSize: "0.8rem",
-              padding: "0.4rem 0.9rem",
-              border: "1px solid #ddd",
-              borderRadius: 6,
-              background: opened ? "white" : "#f0f0f0",
-              color: opened ? "#1a1a2e" : "#aaa",
-              cursor: opened ? "pointer" : "not-allowed",
-            }}
-          >
-            Import
           </button>
         </div>
 

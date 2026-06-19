@@ -13,7 +13,6 @@
 //! every provider.
 
 pub mod benchling;
-pub mod labarchives;
 
 /// Placeholder token replaced by Rust with the localhost bridge port before a
 /// gather script is injected. Shared by all provider scripts.

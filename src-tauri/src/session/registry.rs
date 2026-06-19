@@ -38,10 +38,6 @@ pub fn lookup(key: &str) -> Option<Provider> {
             url: "https://benchling.com",
             gather_script: scripts::benchling::BENCHLING_GATHER_SCRIPT,
         }),
-        "labarchives" => Some(Provider {
-            url: "https://mynotebook.labarchives.com",
-            gather_script: scripts::labarchives::LABARCHIVES_GATHER_SCRIPT,
-        }),
         _ => None,
     }
 }

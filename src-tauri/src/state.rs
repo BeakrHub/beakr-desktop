@@ -16,6 +16,23 @@ pub struct SessionBridge {
     pub shutdown: Arc<tokio::sync::Notify>,
 }
 
+/// The captured Benchling browser session used by the live agent tools.
+///
+/// When the user Connects Benchling and logs in, we capture the HttpOnly
+/// `session` cookie from the benchling.com webview's cookie store (see
+/// `session::commands::connect_session`). The live `benchling_*` tools then call
+/// Benchling's internal `/1/api/*` directly from Rust using `http_client()` with
+/// this cookie, so they work even after the connect window has been closed.
+#[derive(Clone, Debug)]
+pub struct BenchlingSession {
+    /// Value of the benchling.com `session` cookie (HttpOnly).
+    pub session_cookie: String,
+    /// The Benchling tenant host (always `benchling.com` for the free tier).
+    pub tenant_host: String,
+    /// The logged-in user's handle, captured from `GET /1/api/users/me`.
+    pub user_handle: String,
+}
+
 /// Connection status for the WebSocket client.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,8 +75,12 @@ pub struct AppState {
     /// Notifies the WS client when scoped_folders are changed via the UI.
     pub folders_changed: Arc<tokio::sync::Notify>,
     /// Running session-capture localhost bridges, keyed by provider key
-    /// (e.g. "benchling", "labarchives"). One entry per open provider window.
+    /// (currently only "benchling"). One entry per open provider window.
     pub session_bridges: Arc<RwLock<HashMap<String, SessionBridge>>>,
+    /// The captured Benchling browser session, set once the user connects and
+    /// logs in. `None` until a successful connect; the live `benchling_*` tools
+    /// return a reconnect error while it is `None` or after the session expires.
+    pub benchling_session: Arc<RwLock<Option<BenchlingSession>>>,
 }
 
 impl AppState {
@@ -79,6 +100,7 @@ impl AppState {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             folders_changed: Arc::new(tokio::sync::Notify::new()),
             session_bridges: Arc::new(RwLock::new(HashMap::new())),
+            benchling_session: Arc::new(RwLock::new(None)),
         }
     }
 }
