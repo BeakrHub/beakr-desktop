@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod security;
+mod session;
 mod state;
 mod tools;
 mod tray;
@@ -38,6 +39,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(app_state.clone())
         .setup(move |app| {
             // macOS: hide from Dock, show only in menu bar
@@ -84,6 +87,24 @@ pub fn run() {
             // stored token (claim_pairing_code / clear_token keep it in sync after).
             tray::setup_tray(app.handle())?;
             tray::update_tray_pairing(app.handle(), has_stored_token);
+
+            // In dev builds, auto-open the window on launch so testing does not
+            // depend on finding the tray icon. This app is an Accessory app (no
+            // Dock icon), and a full/notched menu bar can hide the tray icon.
+            #[cfg(debug_assertions)]
+            tray::show_settings_window(app.handle());
+
+            // Keep the live Benchling session status honest: a background task
+            // detects when the captured session dies (idle/expired/logout) and
+            // flips the UI + backend to "not connected".
+            {
+                let app_handle = app.handle().clone();
+                let liveness_state = app_state.clone();
+                tauri::async_runtime::spawn(session::benchling::watch_session_liveness(
+                    app_handle,
+                    liveness_state,
+                ));
+            }
 
             // Auto-connect if we have a stored device token
             // (In dev mode without a token, the frontend will handle connection)
@@ -140,6 +161,9 @@ pub fn run() {
             commands::get_stored_token,
             commands::clear_token,
             commands::get_ws_url,
+            session::commands::connect_session,
+            session::commands::session_import,
+            session::commands::benchling_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

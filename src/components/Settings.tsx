@@ -4,6 +4,9 @@ import BeakrLogo from "./BeakrLogo";
 import ConnectionStatus from "./ConnectionStatus";
 import ActivityFeed from "./ActivityFeed";
 import FolderPicker from "./FolderPicker";
+import SessionConnect from "./SessionConnect";
+import UpdateBanner from "./UpdateBanner";
+import { useUpdater } from "../hooks/useUpdater";
 
 interface SettingsProps {
   onUnlink: () => void;
@@ -12,6 +15,7 @@ interface SettingsProps {
 export default function Settings({ onUnlink }: SettingsProps) {
   const [deviceName, setDeviceName] = useState("");
   const [editingName, setEditingName] = useState(false);
+  const updater = useUpdater();
 
   useEffect(() => {
     invoke<string>("get_device_name").then(setDeviceName);
@@ -54,6 +58,8 @@ export default function Settings({ onUnlink }: SettingsProps) {
           Unlink Device
         </button>
       </div>
+
+      <UpdateBanner updater={updater} />
 
       <ConnectionStatus />
 
@@ -119,6 +125,44 @@ export default function Settings({ onUnlink }: SettingsProps) {
       </section>
 
       <FolderPicker />
+
+      <SessionConnect provider="benchling" displayName="Benchling" />
+
+      <footer
+        style={{
+          marginTop: "1.5rem",
+          paddingTop: "1rem",
+          borderTop: "1px solid #eee",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+        }}
+      >
+        <span style={{ fontSize: "0.75rem", color: "#999" }}>
+          Version {updater.currentVersion || "…"}
+          {updater.status === "uptodate" && " — up to date"}
+          {updater.status === "checking" && " — checking…"}
+        </span>
+        <button
+          onClick={() => updater.checkForUpdates()}
+          disabled={
+            updater.status === "checking" ||
+            updater.status === "downloading" ||
+            updater.status === "installing"
+          }
+          style={{
+            fontSize: "0.75rem",
+            padding: "0.25rem 0.6rem",
+            border: "1px solid #ddd",
+            borderRadius: 6,
+            background: "white",
+            cursor: updater.status === "checking" ? "default" : "pointer",
+            opacity: updater.status === "checking" ? 0.6 : 1,
+          }}
+        >
+          Check for updates
+        </button>
+      </footer>
     </div>
   );
 }
