@@ -162,7 +162,6 @@ pub fn run() {
             commands::clear_token,
             commands::get_ws_url,
             session::commands::connect_session,
-            session::commands::session_import,
             session::commands::benchling_status,
         ])
         .run(tauri::generate_context!())

@@ -10,8 +10,7 @@
 //! Benchling's official `/api/v2` is gated to paid tiers, so a free user cannot
 //! use it. The web app itself talks to an internal `/1/api/*` that any logged-in
 //! user can reach with their session cookie. That is exactly what these tools use.
-//! The endpoint contract was confirmed against a live session on 2026-06-18 and is
-//! documented alongside the gather script in `session::scripts::benchling`.
+//! The endpoint contract was confirmed against a live session on 2026-06-18.
 //!
 //! ## Session-capture approach: COOKIE (not in-webview eval)
 //! When the user Connects Benchling and logs in, `session::commands` captures the
@@ -24,7 +23,7 @@
 //!   1. The agent must be able to call these tools AT ANY TIME — including long
 //!      after the user closed the connect window. A pure-Rust HTTP path has no
 //!      dependency on a live webview; an eval path would require the window to
-//!      stay open and a per-call correlation bridge.
+//!      stay open and a per-call correlation channel back to Rust.
 //!   2. macOS WKWebView's cookie store DOES return HttpOnly cookies via
 //!      `WKHTTPCookieStore.getAllCookies`, so the `session` cookie is reliably
 //!      capturable (verified against wry 0.54's `cookies()` implementation).

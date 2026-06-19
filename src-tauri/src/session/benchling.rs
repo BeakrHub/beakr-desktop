@@ -250,7 +250,8 @@ pub async fn watch_session_liveness(app: AppHandle, state: AppState) {
                 // token has not been loaded into state yet.
                 if needs_report {
                     if let Some(token) = state.auth_token.read().await.clone() {
-                        crate::session::bridge::emit_disconnected(&app, "benchling");
+                        let _ = app
+                            .emit("session:disconnected", serde_json::json!({ "provider": "benchling" }));
                         report_disconnect(&token).await;
                         needs_report = false;
                     }
@@ -263,7 +264,8 @@ pub async fn watch_session_liveness(app: AppHandle, state: AppState) {
                     // 401 — the session expired or the user logged out.
                     *state.benchling_session.write().await = None;
                     if needs_report {
-                        crate::session::bridge::emit_disconnected(&app, "benchling");
+                        let _ = app
+                            .emit("session:disconnected", serde_json::json!({ "provider": "benchling" }));
                         if let Some(token) = state.auth_token.read().await.clone() {
                             report_disconnect(&token).await;
                         }

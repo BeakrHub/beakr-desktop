@@ -1,20 +1,6 @@
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-/// A running per-provider session-capture localhost bridge.
-///
-/// One instance exists per open provider window. The `port` is substituted into
-/// the provider's gather script; triggering `shutdown` tears down only this
-/// provider's listener, leaving other providers' bridges untouched.
-#[derive(Clone)]
-pub struct SessionBridge {
-    /// Port of this provider's running localhost data bridge.
-    pub port: u16,
-    /// Notifies this provider's bridge listener to shut down.
-    pub shutdown: Arc<tokio::sync::Notify>,
-}
 
 /// The captured Benchling browser session used by the live agent tools.
 ///
@@ -74,9 +60,6 @@ pub struct AppState {
     pub shutdown_requested: Arc<AtomicBool>,
     /// Notifies the WS client when scoped_folders are changed via the UI.
     pub folders_changed: Arc<tokio::sync::Notify>,
-    /// Running session-capture localhost bridges, keyed by provider key
-    /// (currently only "benchling"). One entry per open provider window.
-    pub session_bridges: Arc<RwLock<HashMap<String, SessionBridge>>>,
     /// The captured Benchling browser session, set once the user connects and
     /// logs in. `None` until a successful connect; the live `benchling_*` tools
     /// return a reconnect error while it is `None` or after the session expires.
@@ -99,7 +82,6 @@ impl AppState {
             ws_shutdown: Arc::new(tokio::sync::Notify::new()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             folders_changed: Arc::new(tokio::sync::Notify::new()),
-            session_bridges: Arc::new(RwLock::new(HashMap::new())),
             benchling_session: Arc::new(RwLock::new(None)),
         }
     }
