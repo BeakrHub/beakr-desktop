@@ -15,17 +15,30 @@ interface SettingsProps {
 export default function Settings({ onUnlink }: SettingsProps) {
   const [deviceName, setDeviceName] = useState("");
   const [editingName, setEditingName] = useState(false);
+  const [deviceNameError, setDeviceNameError] = useState<string | null>(null);
   const updater = useUpdater();
 
   useEffect(() => {
-    invoke<string>("get_device_name").then(setDeviceName);
+    invoke<string>("get_device_name")
+      .then(setDeviceName)
+      .catch(() => setDeviceNameError("Could not load device name."));
   }, []);
 
   const saveDeviceName = async () => {
-    if (deviceName.trim()) {
-      await invoke("set_device_name", { name: deviceName.trim() });
+    const trimmed = deviceName.trim();
+    if (!trimmed) {
+      setDeviceNameError("Device name cannot be empty.");
+      return;
     }
-    setEditingName(false);
+
+    setDeviceNameError(null);
+    try {
+      await invoke("set_device_name", { name: trimmed });
+      setDeviceName(trimmed);
+      setEditingName(false);
+    } catch (e) {
+      setDeviceNameError(typeof e === "string" ? e : "Could not save device name.");
+    }
   };
 
   return (
@@ -121,6 +134,19 @@ export default function Settings({ onUnlink }: SettingsProps) {
               Edit
             </button>
           </div>
+        )}
+        {deviceNameError && (
+          <p
+            role="alert"
+            style={{
+              color: "#dc2626",
+              fontSize: "0.78rem",
+              marginTop: "0.5rem",
+              marginBottom: 0,
+            }}
+          >
+            {deviceNameError}
+          </p>
         )}
       </section>
 

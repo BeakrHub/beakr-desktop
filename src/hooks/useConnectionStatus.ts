@@ -24,6 +24,10 @@ export function useConnectionStatus(): ConnectionState {
           : "disconnected";
         setStatus(s);
         setDeviceId(result.device_id);
+      })
+      .catch(() => {
+        setStatus("disconnected");
+        setDeviceId(null);
       });
 
     // Listen for status changes
@@ -37,6 +41,9 @@ export function useConnectionStatus(): ConnectionState {
       invoke<{ status: string; device_id: string | null }>("get_connection_status")
         .then((result) => {
           setDeviceId(result.device_id);
+        })
+        .catch(() => {
+          setDeviceId(null);
         });
     });
 

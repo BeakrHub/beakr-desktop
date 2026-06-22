@@ -34,11 +34,13 @@ export default function PairingScreen({ onPaired }: PairingScreenProps) {
   // Determine which environment we're pointing at (read from Rust side)
   const [envLabel, setEnvLabel] = useState("...");
   useEffect(() => {
-    invoke<string>("get_ws_url").then((url) => {
-      if (url.includes("sandbox")) setEnvLabel("Sandbox");
-      else if (url.includes("localhost")) setEnvLabel("Local Dev");
-      else setEnvLabel("Production");
-    });
+    invoke<string>("get_ws_url")
+      .then((url) => {
+        if (url.includes("sandbox")) setEnvLabel("Sandbox");
+        else if (url.includes("localhost")) setEnvLabel("Local Dev");
+        else setEnvLabel("Production");
+      })
+      .catch(() => setEnvLabel("Unknown"));
   }, []);
 
   return (

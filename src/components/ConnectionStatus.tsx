@@ -1,8 +1,10 @@
 import { useConnectionStatus } from "../hooks/useConnectionStatus";
 import { invoke } from "@tauri-apps/api/core";
+import { useState } from "react";
 
 export default function ConnectionStatus() {
   const { status, deviceId } = useConnectionStatus();
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const isConnected = status === "connected";
   const isRevoked = status === "revoked";
@@ -17,8 +19,17 @@ export default function ConnectionStatus() {
     revoked: "Device Revoked",
   };
 
-  const handleConnect = () => invoke("connect_ws");
-  const handleDisconnect = () => invoke("disconnect_ws");
+  const runConnectionAction = async (command: "connect_ws" | "disconnect_ws") => {
+    setActionError(null);
+    try {
+      await invoke(command);
+    } catch (e) {
+      setActionError(typeof e === "string" ? e : "Connection action failed");
+    }
+  };
+
+  const handleConnect = () => runConnectionAction("connect_ws");
+  const handleDisconnect = () => runConnectionAction("disconnect_ws");
 
   return (
     <div
@@ -94,6 +105,19 @@ export default function ConnectionStatus() {
           }}
         >
           Device ID: {deviceId}
+        </p>
+      )}
+      {actionError && (
+        <p
+          role="alert"
+          style={{
+            color: "#dc2626",
+            fontSize: "0.75rem",
+            marginTop: "0.5rem",
+            marginBottom: 0,
+          }}
+        >
+          {actionError}
         </p>
       )}
     </div>

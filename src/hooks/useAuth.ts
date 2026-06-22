@@ -29,7 +29,9 @@ export function useAuth() {
 
           if (!didConnect.current) {
             didConnect.current = true;
-            invoke("connect_ws");
+            invoke("connect_ws").catch(() => {
+              didConnect.current = false;
+            });
           }
         } else {
           setHasToken(false);

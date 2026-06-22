@@ -11,24 +11,40 @@ const ACCESS_NOTE_ACK_KEY = "beakr-folder-access-acknowledged";
 export default function FolderPicker() {
   const [folders, setFolders] = useState<string[]>([]);
   const [showAccessNote, setShowAccessNote] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    invoke<string[]>("get_scoped_folders").then(setFolders);
+    invoke<string[]>("get_scoped_folders")
+      .then(setFolders)
+      .catch((e) => {
+        setError(typeof e === "string" ? e : "Could not load allowed folders.");
+      });
   }, []);
 
   // Open the native picker and persist the new folder. Separated from the click
   // handler so the one-time note can gate the first call without duplicating it.
   const pickAndAddFolder = async () => {
-    const selected = await open({ directory: true, multiple: false });
-    if (selected && typeof selected === "string") {
+    setError(null);
+    try {
+      const selected = await open({ directory: true, multiple: false });
+      if (!selected || typeof selected !== "string") return;
+      if (folders.includes(selected)) return;
+
       const updated = [...folders, selected];
-      setFolders(updated);
+      setSaving(true);
       await invoke("set_scoped_folders", { folders: updated });
+      setFolders(updated);
+    } catch (e) {
+      setError(typeof e === "string" ? e : "Could not update allowed folders.");
+    } finally {
+      setSaving(false);
     }
   };
 
   const handleAddFolderClick = async () => {
-    if (!localStorage.getItem(ACCESS_NOTE_ACK_KEY)) {
+    const acknowledged = localStorage.getItem(ACCESS_NOTE_ACK_KEY);
+    if (!acknowledged) {
       setShowAccessNote(true);
       return;
     }
@@ -42,9 +58,17 @@ export default function FolderPicker() {
   };
 
   const removeFolder = async (index: number) => {
+    setError(null);
     const updated = folders.filter((_, i) => i !== index);
-    setFolders(updated);
-    await invoke("set_scoped_folders", { folders: updated });
+    try {
+      setSaving(true);
+      await invoke("set_scoped_folders", { folders: updated });
+      setFolders(updated);
+    } catch (e) {
+      setError(typeof e === "string" ? e : "Could not remove folder.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -62,13 +86,15 @@ export default function FolderPicker() {
         </h2>
         <button
           onClick={handleAddFolderClick}
+          disabled={saving}
           style={{
             fontSize: "0.8rem",
             padding: "0.25rem 0.75rem",
             border: "1px solid #ddd",
             borderRadius: 6,
             background: "white",
-            cursor: "pointer",
+            cursor: saving ? "default" : "pointer",
+            opacity: saving ? 0.6 : 1,
           }}
         >
           + Add Folder
@@ -78,6 +104,15 @@ export default function FolderPicker() {
       <p style={{ color: "#666", fontSize: "0.8rem", marginBottom: "0.75rem" }}>
         The AI agent can only access files within these folders.
       </p>
+
+      {error && (
+        <p
+          role="alert"
+          style={{ color: "#dc2626", fontSize: "0.8rem", marginBottom: "0.75rem" }}
+        >
+          {error}
+        </p>
+      )}
 
       {folders.length === 0 ? (
         <div
@@ -121,6 +156,7 @@ export default function FolderPicker() {
               </span>
               <button
                 onClick={() => removeFolder(i)}
+                disabled={saving}
                 style={{
                   fontSize: "0.75rem",
                   padding: "0.15rem 0.5rem",
@@ -128,7 +164,8 @@ export default function FolderPicker() {
                   borderRadius: 4,
                   background: "white",
                   color: "#c00",
-                  cursor: "pointer",
+                  cursor: saving ? "default" : "pointer",
+                  opacity: saving ? 0.6 : 1,
                   flexShrink: 0,
                 }}
               >
