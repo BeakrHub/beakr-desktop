@@ -1,5 +1,5 @@
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
@@ -16,7 +16,20 @@ use crate::state::{AppState, ConnectionStatus};
 use crate::tools;
 use crate::ws::protocol::{IncomingMessage, OutgoingMessage, ResponseStatus};
 
+/// App-level heartbeat that refreshes the engine's Redis online key.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(45);
+/// WebSocket-level Ping cadence used purely for liveness detection. A healthy
+/// link answers each Ping with a Pong almost immediately; the absence of any
+/// inbound frame within `LIVENESS_TIMEOUT` is how we detect a half-open socket
+/// (sleep/wake, Wi-Fi/VPN/route change) that the OS hasn't yet torn down.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// Max time without ANY inbound frame before we treat the link as dead and force
+/// a reconnect. Must be `> PING_INTERVAL` (so a live link always refreshes in
+/// time) and `<` the engine's 60s online-key TTL (so `is_online` recovers via a
+/// fresh `register()` without a manual app restart).
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often we re-check the liveness deadline.
+const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// WebSocket close codes from the server.
@@ -229,6 +242,19 @@ impl WsClient {
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.tick().await; // consume the first immediate tick
 
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.tick().await; // consume the first immediate tick
+
+        let mut liveness = tokio::time::interval(LIVENESS_CHECK_INTERVAL);
+        liveness.tick().await; // consume the first immediate tick
+
+        // Time of the last inbound frame of ANY kind. A live link refreshes this
+        // on every Ping->Pong round-trip; a half-open socket lets it go stale,
+        // which the liveness branch turns into a reconnect. Without this the read
+        // arm could block forever on a silently-dead socket while the tray still
+        // showed "Connected" and the engine's online key expired (ENG-1261).
+        let mut last_inbound = Instant::now();
+
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => {
@@ -239,15 +265,44 @@ impl WsClient {
                     }
                 }
 
+                _ = ping.tick() => {
+                    // Active liveness probe: on a dead path the Pong never comes
+                    // back, so `last_inbound` goes stale and the liveness branch
+                    // below forces a reconnect. (A `write.send` that errors here —
+                    // e.g. once the OS finally times out the socket — also exits.)
+                    if write.send(Message::Ping(Vec::new())).await.is_err() {
+                        return None;
+                    }
+                }
+
+                _ = liveness.tick() => {
+                    if link_is_dead(last_inbound.elapsed(), LIVENESS_TIMEOUT) {
+                        log::warn!(
+                            "No inbound frame for {:?} (> {LIVENESS_TIMEOUT:?}) — link is dead, reconnecting",
+                            last_inbound.elapsed(),
+                        );
+                        return None;
+                    }
+                }
+
                 msg = read.next() => {
                     match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            self.handle_text_message(&text, write).await;
-                        }
-                        Some(Ok(Message::Close(frame))) => {
-                            let code = frame.as_ref().map(|f| f.code.into());
-                            log::info!("WebSocket closed with code: {code:?}");
-                            return code;
+                        Some(Ok(message)) => {
+                            // Any inbound frame (including Pong) proves the link is
+                            // alive — record it before dispatching.
+                            last_inbound = Instant::now();
+                            match message {
+                                Message::Text(text) => {
+                                    self.handle_text_message(&text, write).await;
+                                }
+                                Message::Close(frame) => {
+                                    let code = frame.as_ref().map(|f| f.code.into());
+                                    log::info!("WebSocket closed with code: {code:?}");
+                                    return code;
+                                }
+                                // Pong / Ping / Binary: liveness already recorded.
+                                _ => {}
+                            }
                         }
                         Some(Err(e)) => {
                             log::error!("WebSocket read error: {e}");
@@ -257,7 +312,6 @@ impl WsClient {
                             log::info!("WebSocket stream ended");
                             return None;
                         }
-                        _ => {}
                     }
                 }
 
@@ -373,6 +427,13 @@ fn is_revoked_handshake(err: &tokio_tungstenite::tungstenite::Error) -> bool {
     matches!(err, Error::Http(response) if response.status() == StatusCode::FORBIDDEN)
 }
 
+/// Whether the WebSocket link should be considered dead, given how long it has
+/// been since the last inbound frame. Extracted as a pure function so the
+/// liveness invariant is unit-testable without a live socket.
+fn link_is_dead(since_last_inbound: Duration, timeout: Duration) -> bool {
+    since_last_inbound > timeout
+}
+
 fn current_platform() -> &'static str {
     if cfg!(target_os = "macos") {
         "macos"
@@ -441,5 +502,29 @@ mod tests {
     fn transient_connection_errors_are_not_revoked() {
         // A dropped socket must remain retryable (backoff), not terminal-revoked.
         assert!(!is_revoked_handshake(&Error::ConnectionClosed));
+    }
+
+    #[test]
+    fn link_is_dead_after_timeout() {
+        // ENG-1261: once no inbound frame has arrived for longer than the
+        // liveness timeout, the link is treated as dead so the loop reconnects.
+        assert!(link_is_dead(Duration::from_secs(31), Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn link_is_alive_within_timeout() {
+        assert!(!link_is_dead(Duration::from_secs(10), Duration::from_secs(30)));
+        // Exactly at the boundary is still alive (strictly-greater comparison).
+        assert!(!link_is_dead(Duration::from_secs(30), Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn liveness_constants_are_ordered_for_recovery() {
+        // The Ping must fire before the liveness deadline so a healthy link
+        // always refreshes `last_inbound` in time; the deadline must beat the
+        // engine's 60s online-key TTL so a dead link reconnects (fresh
+        // register()) before `is_online` goes stale and strands the Ask "+".
+        assert!(PING_INTERVAL < LIVENESS_TIMEOUT);
+        assert!(LIVENESS_TIMEOUT < Duration::from_secs(60));
     }
 }
