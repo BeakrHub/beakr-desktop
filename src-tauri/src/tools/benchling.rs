@@ -196,9 +196,12 @@ async fn api_get(state: &AppState, sess: &BenchlingSession, path: &str) -> Resul
 }
 
 /// Recursively rewrites Benchling's relative URL fields (`url`, `editURL`,
-/// `webURL`, `owner_url`) to absolute `https://<host>/...`, stripping a trailing
-/// `/edit` so links open the view (not the editor). Absolute values (e.g.
-/// `avatar_url` on a CDN) are left untouched since they do not start with `/`.
+/// `webURL`, `owner_url`) to absolute `https://<host>/...`. The path is kept
+/// exactly as Benchling provides it, including a trailing `/edit`: on path-handle
+/// (free-tier) tenants the non-`/edit` form 404s, so `/edit` is the URL that
+/// actually resolves (verified live against a david-beakr sequence). Absolute
+/// values (e.g. `avatar_url` on a CDN) are left untouched since they do not
+/// start with `/`.
 fn absolutize_urls(value: &mut Value, host: &str) {
     match value {
         Value::Object(map) => {
@@ -206,8 +209,7 @@ fn absolutize_urls(value: &mut Value, host: &str) {
                 if matches!(k.as_str(), "url" | "editURL" | "webURL" | "owner_url") {
                     if let Value::String(s) = v {
                         if s.starts_with('/') {
-                            let path = s.strip_suffix("/edit").unwrap_or(s).to_string();
-                            *s = format!("https://{host}{path}");
+                            *s = format!("https://{host}{s}");
                         }
                         continue;
                     }
@@ -786,6 +788,24 @@ mod tests {
         // No array anywhere -> empty.
         let none = json!({ "n": 1 });
         assert!(pick_array(&none, &["files"]).is_empty());
+    }
+
+    #[test]
+    fn absolutize_urls_preserves_edit_suffix() {
+        // Regression: Benchling returns the item link as a relative editURL ending
+        // in `/edit`. The non-/edit form 404s on path-handle (free-tier) tenants, so
+        // the suffix must be preserved (it was previously stripped -> dead link).
+        let mut v = json!({
+            "editURL": "/david-beakr/f/lib_1-proj/seq_1-scramble/edit",
+            "avatar_url": "https://cdn.example.com/x.png",
+        });
+        absolutize_urls(&mut v, "benchling.com");
+        assert_eq!(
+            v["editURL"],
+            json!("https://benchling.com/david-beakr/f/lib_1-proj/seq_1-scramble/edit")
+        );
+        // Absolute URLs (not starting with `/`) are left untouched.
+        assert_eq!(v["avatar_url"], json!("https://cdn.example.com/x.png"));
     }
 
     #[test]
