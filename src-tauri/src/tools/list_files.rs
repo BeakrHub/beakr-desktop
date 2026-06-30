@@ -10,21 +10,24 @@ use crate::unicode;
 /// - `path` (string, required): Directory to list
 /// - `recursive` (bool, optional): Recurse into subdirectories
 /// - `pattern` (string, optional): Glob pattern to filter files
-pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, Option<u64>), String> {
-    let path = params.get("path")
+pub async fn handle(
+    params: Value,
+    scoped_folders: &[String],
+) -> Result<(Value, Option<u64>), String> {
+    let path = params
+        .get("path")
         .and_then(|v| v.as_str())
         .ok_or("list_files requires 'path' parameter")?;
 
-    let recursive = params.get("recursive")
+    let recursive = params
+        .get("recursive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let pattern = params.get("pattern")
-        .and_then(|v| v.as_str());
+    let pattern = params.get("pattern").and_then(|v| v.as_str());
 
     // Validate path is within scoped folders
-    let canonical = security::validate_path(path, scoped_folders)
-        .map_err(|e| e.to_string())?;
+    let canonical = security::validate_path(path, scoped_folders).map_err(|e| e.to_string())?;
 
     // Compile glob pattern if provided
     let glob_pattern = match pattern {
@@ -75,9 +78,10 @@ pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, 
             "file"
         };
 
-        let modified_at = metadata.modified().ok().map(|t| {
-            chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
-        });
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
 
         files.push(json!({
             "name": unicode::normalize_whitespace(&file_name),

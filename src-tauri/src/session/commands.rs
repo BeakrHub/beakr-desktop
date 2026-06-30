@@ -27,8 +27,8 @@ pub async fn connect_session(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let registered: Provider =
-        registry::lookup(&provider).ok_or_else(|| format!("Unknown session provider: {provider}"))?;
+    let registered: Provider = registry::lookup(&provider)
+        .ok_or_else(|| format!("Unknown session provider: {provider}"))?;
 
     let window_label = registry::window_label(&provider);
 
@@ -45,15 +45,12 @@ pub async fn connect_session(
         .parse()
         .map_err(|e| format!("Invalid provider URL: {e}"))?;
 
-    let builder = tauri::WebviewWindowBuilder::new(
-        &app,
-        &window_label,
-        tauri::WebviewUrl::External(url),
-    )
-    .title(format!("Connect {provider}"))
-    .inner_size(1100.0, 800.0)
-    .resizable(true)
-    .center();
+    let builder =
+        tauri::WebviewWindowBuilder::new(&app, &window_label, tauri::WebviewUrl::External(url))
+            .title(format!("Connect {provider}"))
+            .inner_size(1100.0, 800.0)
+            .resizable(true)
+            .center();
 
     builder
         .build()
@@ -82,16 +79,11 @@ pub async fn connect_session(
 pub async fn benchling_status(
     state: State<'_, AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
-    Ok(state
-        .benchling_session
-        .read()
-        .await
-        .as_ref()
-        .map(|s| {
-            serde_json::json!({
-                "connected": true,
-                "user_handle": s.user_handle,
-                "tenant_host": s.tenant_host,
-            })
-        }))
+    Ok(state.benchling_session.read().await.as_ref().map(|s| {
+        serde_json::json!({
+            "connected": true,
+            "user_handle": s.user_handle,
+            "tenant_host": s.tenant_host,
+        })
+    }))
 }

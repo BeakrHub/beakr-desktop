@@ -5,11 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use tauri::{AppHandle, Emitter};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::{
-    client::IntoClientRequest,
-    http::HeaderValue,
-    Message,
-};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::state::{AppState, ConnectionStatus};
@@ -105,7 +101,10 @@ impl WsClient {
             let jitter_factor = rand::thread_rng().gen_range(0.8..1.2);
             let wait = backoff.mul_f64(jitter_factor);
 
-            log::info!("Reconnecting in {:.1}s (attempt {attempt})", wait.as_secs_f64());
+            log::info!(
+                "Reconnecting in {:.1}s (attempt {attempt})",
+                wait.as_secs_f64()
+            );
 
             // Request a fresh token from the frontend before reconnecting
             let _ = self.app.emit("token_refresh_needed", ());
@@ -127,7 +126,9 @@ impl WsClient {
     }
 
     /// Connect, register, and run the message loop. Returns the close code if any.
-    async fn connect_and_run(&self) -> Result<Option<u16>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn connect_and_run(
+        &self,
+    ) -> Result<Option<u16>, Box<dyn std::error::Error + Send + Sync>> {
         let token = self.state.auth_token.read().await.clone();
 
         // Build request — use subprotocol auth in production, query params in dev
@@ -140,10 +141,9 @@ impl WsClient {
                 "Sec-WebSocket-Protocol",
                 HeaderValue::from_str(&subprotocol)?,
             );
-            request.headers_mut().insert(
-                "User-Agent",
-                HeaderValue::from_str(&user_agent)?,
-            );
+            request
+                .headers_mut()
+                .insert("User-Agent", HeaderValue::from_str(&user_agent)?);
             tokio_tungstenite::connect_async(request).await
         } else if cfg!(debug_assertions) {
             // Dev mode: use query params for auth (matches backend dev bypass)
@@ -152,10 +152,9 @@ impl WsClient {
                 self.ws_url
             );
             let mut request = dev_url.as_str().into_client_request()?;
-            request.headers_mut().insert(
-                "User-Agent",
-                HeaderValue::from_str(&user_agent)?,
-            );
+            request
+                .headers_mut()
+                .insert("User-Agent", HeaderValue::from_str(&user_agent)?);
             tokio_tungstenite::connect_async(request).await
         } else {
             return Err("No auth token available".into());
@@ -208,14 +207,13 @@ impl WsClient {
             return Ok(code);
         }
 
-        let registered_text = registered_msg.to_text().map_err(|_| {
-            format!("Expected text message but got: {:?}", registered_msg)
-        })?;
+        let registered_text = registered_msg
+            .to_text()
+            .map_err(|_| format!("Expected text message but got: {:?}", registered_msg))?;
 
-        let incoming: IncomingMessage = serde_json::from_str(registered_text)
-            .map_err(|e| format!(
-                "Failed to parse registration response: {e} (raw: {registered_text:?})"
-            ))?;
+        let incoming: IncomingMessage = serde_json::from_str(registered_text).map_err(|e| {
+            format!("Failed to parse registration response: {e} (raw: {registered_text:?})")
+        })?;
 
         let device_id = match incoming {
             IncomingMessage::Registered { device_id } => device_id,
@@ -236,7 +234,10 @@ impl WsClient {
     /// Main message loop: heartbeat + incoming request handling.
     async fn message_loop(
         &self,
-        write: &mut futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        write: &mut futures_util::stream::SplitSink<
+            WebSocketStream<MaybeTlsStream<TcpStream>>,
+            Message,
+        >,
         read: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     ) -> Option<u16> {
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -343,7 +344,10 @@ impl WsClient {
     async fn handle_text_message(
         &self,
         text: &str,
-        write: &mut futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        write: &mut futures_util::stream::SplitSink<
+            WebSocketStream<MaybeTlsStream<TcpStream>>,
+            Message,
+        >,
     ) {
         let incoming: IncomingMessage = match serde_json::from_str(text) {
             Ok(m) => m,
@@ -354,41 +358,57 @@ impl WsClient {
         };
 
         match incoming {
-            IncomingMessage::Request { request_id, tool, params } => {
+            IncomingMessage::Request {
+                request_id,
+                tool,
+                params,
+            } => {
                 let scoped_folders = self.state.scoped_folders.read().await.clone();
 
                 // Notify frontend that a tool request started
-                let _ = self.app.emit("tool:request_started", serde_json::json!({
-                    "request_id": &request_id,
-                    "tool": &tool,
-                    "params": &params,
-                }));
+                let _ = self.app.emit(
+                    "tool:request_started",
+                    serde_json::json!({
+                        "request_id": &request_id,
+                        "tool": &tool,
+                        "params": &params,
+                    }),
+                );
 
                 let response =
                     tools::dispatch_request(&tool, params, &scoped_folders, &self.state).await;
 
                 let (outgoing, result_status) = match response {
-                    Ok((data, bytes)) => (OutgoingMessage::Response {
-                        request_id: request_id.clone(),
-                        status: ResponseStatus::Success,
-                        data: Some(data),
-                        error: None,
-                        bytes_transferred: bytes,
-                    }, "success"),
-                    Err(e) => (OutgoingMessage::Response {
-                        request_id: request_id.clone(),
-                        status: ResponseStatus::Error,
-                        data: None,
-                        error: Some(e),
-                        bytes_transferred: None,
-                    }, "error"),
+                    Ok((data, bytes)) => (
+                        OutgoingMessage::Response {
+                            request_id: request_id.clone(),
+                            status: ResponseStatus::Success,
+                            data: Some(data),
+                            error: None,
+                            bytes_transferred: bytes,
+                        },
+                        "success",
+                    ),
+                    Err(e) => (
+                        OutgoingMessage::Response {
+                            request_id: request_id.clone(),
+                            status: ResponseStatus::Error,
+                            data: None,
+                            error: Some(e),
+                            bytes_transferred: None,
+                        },
+                        "error",
+                    ),
                 };
 
                 // Notify frontend that the request completed
-                let _ = self.app.emit("tool:request_completed", serde_json::json!({
-                    "request_id": &request_id,
-                    "status": result_status,
-                }));
+                let _ = self.app.emit(
+                    "tool:request_completed",
+                    serde_json::json!({
+                        "request_id": &request_id,
+                        "status": result_status,
+                    }),
+                );
 
                 let json = match serde_json::to_string(&outgoing) {
                     Ok(j) => j,
@@ -414,7 +434,6 @@ impl WsClient {
         *self.state.ws_status.write().await = status;
         let _ = self.app.emit("ws:status_changed", status_str);
     }
-
 }
 
 /// True when a connect error is a 403 Forbidden returned at the HTTP handshake —
@@ -495,7 +514,9 @@ mod tests {
         // 401/500 are not the revoke signal — they must stay retryable, not
         // collapse into a permanent unlink.
         assert!(!is_revoked_handshake(&http_error(StatusCode::UNAUTHORIZED)));
-        assert!(!is_revoked_handshake(&http_error(StatusCode::INTERNAL_SERVER_ERROR)));
+        assert!(!is_revoked_handshake(&http_error(
+            StatusCode::INTERNAL_SERVER_ERROR
+        )));
     }
 
     #[test]
@@ -508,14 +529,23 @@ mod tests {
     fn link_is_dead_after_timeout() {
         // ENG-1261: once no inbound frame has arrived for longer than the
         // liveness timeout, the link is treated as dead so the loop reconnects.
-        assert!(link_is_dead(Duration::from_secs(31), Duration::from_secs(30)));
+        assert!(link_is_dead(
+            Duration::from_secs(31),
+            Duration::from_secs(30)
+        ));
     }
 
     #[test]
     fn link_is_alive_within_timeout() {
-        assert!(!link_is_dead(Duration::from_secs(10), Duration::from_secs(30)));
+        assert!(!link_is_dead(
+            Duration::from_secs(10),
+            Duration::from_secs(30)
+        ));
         // Exactly at the boundary is still alive (strictly-greater comparison).
-        assert!(!link_is_dead(Duration::from_secs(30), Duration::from_secs(30)));
+        assert!(!link_is_dead(
+            Duration::from_secs(30),
+            Duration::from_secs(30)
+        ));
     }
 
     #[test]

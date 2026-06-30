@@ -29,9 +29,8 @@ pub fn validate_path(path: &str, scoped_folders: &[String]) -> Result<PathBuf, S
         Ok(p) => p,
         Err(original_err) => {
             if let Some(resolved) = unicode::try_resolve_unicode_path(path) {
-                std::fs::canonicalize(&resolved).map_err(|e| {
-                    SecurityError::ResolutionFailed(format!("{path}: {e}"))
-                })?
+                std::fs::canonicalize(&resolved)
+                    .map_err(|e| SecurityError::ResolutionFailed(format!("{path}: {e}")))?
             } else {
                 return Err(SecurityError::ResolutionFailed(format!(
                     "{path}: {original_err}"
@@ -51,9 +50,7 @@ pub fn validate_path(path: &str, scoped_folders: &[String]) -> Result<PathBuf, S
         }
     }
 
-    Err(SecurityError::OutOfScope(
-        canonical.display().to_string(),
-    ))
+    Err(SecurityError::OutOfScope(canonical.display().to_string()))
 }
 
 #[cfg(test)]
@@ -80,7 +77,10 @@ mod tests {
         // Use a nonexistent scoped folder so any real path falls outside scope.
         // The path just needs to exist on the OS for canonicalize to succeed,
         // but it doesn't matter since the scoped folder won't match.
-        let scoped = vec![env::temp_dir().join("beakr_test_nonexistent").display().to_string()];
+        let scoped = vec![env::temp_dir()
+            .join("beakr_test_nonexistent")
+            .display()
+            .to_string()];
         // Use temp_dir itself as the target — it exists on all platforms
         let target = env::temp_dir().join("beakr_oob_test");
         std::fs::write(&target, "test").unwrap();

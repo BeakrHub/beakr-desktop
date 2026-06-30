@@ -53,6 +53,12 @@ fn api_base(sess: &BenchlingSession) -> String {
 /// The agent surfaces this verbatim to tell the user how to recover.
 const RECONNECT_ERROR: &str = "Benchling session expired - reconnect in the Beakr desktop app";
 
+/// Entry content search is a fallback over per-entry detail requests. Keep it
+/// bounded so a broad workspace query does not turn a healthy desktop into a
+/// false "offline" timeout.
+const ENTRY_CONTENT_SEARCH_LIMIT: usize = 75;
+const ENTRY_CONTENT_SEARCH_CONCURRENCY: usize = 8;
+
 /// Item-kind classification by Benchling id prefix (confirmed 2026-06-18).
 /// `etr_`=entry, `prt_`=protocol, `seq_`=DNA/AA sequence, `file_`=uploaded file;
 /// any other prefix (e.g. `bfi_`, custom-entity ids) is treated as a custom entity.
@@ -157,8 +163,8 @@ async fn api_get(state: &AppState, sess: &BenchlingSession, path: &str) -> Resul
         .text()
         .await
         .map_err(|e| format!("Failed to read Benchling response: {e}"))?;
-    let mut json: Value =
-        serde_json::from_str(&text).map_err(|e| format!("Invalid Benchling JSON for {path}: {e}"))?;
+    let mut json: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Invalid Benchling JSON for {path}: {e}"))?;
     // Benchling's /1/api returns RELATIVE URL paths (e.g. "/mstrome/f_/...").
     // Rewrite them to absolute https://<tenant_host>/... so links resolve to
     // Benchling, not the Beakr app origin that renders the tool result (which
@@ -226,12 +232,36 @@ fn folder_id(folder: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Surface a project's stable `lib_…` identifier as its `id` so the agent can
+/// round-trip list -> get. The raw `/folders` object carries a numeric `id` plus
+/// the stable `api_identifier`; `get_project` resolves `/folders/{id}`, which only
+/// accepts the `api_identifier`. Without this the agent passes the numeric id and
+/// gets a 404 ("project does not exist"). The numeric id is preserved as `db_id`.
+fn normalize_project(mut folder: Value) -> Value {
+    if let Some(fid) = folder_id(&folder) {
+        if let Value::Object(map) = &mut folder {
+            if let Some(prev) = map.insert("id".to_string(), Value::String(fid)) {
+                map.entry("db_id".to_string()).or_insert(prev);
+            }
+        }
+    }
+    folder
+}
+
 fn item_name(item: &Value) -> String {
     item.get("name")
         .and_then(|v| v.as_str())
         .or_else(|| item.get("displayName").and_then(|v| v.as_str()))
         .unwrap_or("")
         .to_string()
+}
+
+fn item_id(item: &Value) -> Option<String> {
+    item.get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| item.get("api_identifier").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Lists all projects (folders) for the session.
@@ -308,8 +338,7 @@ async fn collect_items(
                 continue;
             }
             // Files and protocols are never surfaced as custom entities.
-            if kind == ItemKind::CustomEntity
-                && (id.starts_with("file_") || id.starts_with("prt_"))
+            if kind == ItemKind::CustomEntity && (id.starts_with("file_") || id.starts_with("prt_"))
             {
                 continue;
             }
@@ -331,14 +360,23 @@ async fn collect_items(
 
 async fn list_projects(state: &AppState) -> Result<Value, String> {
     let sess = session(state).await?;
-    let projects = fetch_projects(state, &sess).await?;
+    let projects: Vec<Value> = fetch_projects(state, &sess)
+        .await?
+        .into_iter()
+        .map(normalize_project)
+        .collect();
     Ok(json!({ "projects": projects }))
 }
 
 async fn get_project(state: &AppState, params: &Value) -> Result<Value, String> {
     let sess = session(state).await?;
     let id = require_str(params, "project_id")?;
-    api_get(state, &sess, &format!("/folders/{}", urlencoding::encode(&id))).await
+    api_get(
+        state,
+        &sess,
+        &format!("/folders/{}", urlencoding::encode(&id)),
+    )
+    .await
 }
 
 async fn list_entries(state: &AppState, params: &Value) -> Result<Value, String> {
@@ -403,6 +441,7 @@ async fn search_projects(state: &AppState, params: &Value) -> Result<Value, Stri
     let matches: Vec<Value> = projects
         .into_iter()
         .filter(|p| name_contains(&item_name(p), &query))
+        .map(normalize_project)
         .collect();
     Ok(json!({ "projects": matches }))
 }
@@ -411,7 +450,88 @@ async fn search_entries(state: &AppState, params: &Value) -> Result<Value, Strin
     let sess = session(state).await?;
     let query = require_str(params, "query")?;
     let entries = collect_items(state, &sess, None, ItemKind::Entry).await?;
-    Ok(json!({ "entries": filter_by_name(entries, &query) }))
+    let mut seen = std::collections::HashSet::new();
+    let mut matches = Vec::new();
+    let mut title_match_count = 0;
+
+    for entry in &entries {
+        if name_contains(&item_name(entry), &query) {
+            if let Some(id) = item_id(entry) {
+                seen.insert(id);
+            }
+            let mut matched = entry.clone();
+            set_match_source(&mut matched, "title");
+            matches.push(matched);
+            title_match_count += 1;
+        }
+    }
+
+    let candidates: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| item_id(entry).is_some_and(|id| !seen.contains(&id)))
+        .collect();
+    let content_search_truncated = candidates.len() > ENTRY_CONTENT_SEARCH_LIMIT;
+    let mut content_entries_scanned = 0;
+    let mut content_match_count = 0;
+    let mut content_scan_errors = 0;
+
+    let scan_inputs: Vec<(Value, String)> = candidates
+        .into_iter()
+        .take(ENTRY_CONTENT_SEARCH_LIMIT)
+        .filter_map(|entry| item_id(entry).map(|id| (entry.clone(), id)))
+        .collect();
+
+    for chunk in scan_inputs.chunks(ENTRY_CONTENT_SEARCH_CONCURRENCY) {
+        let mut handles = Vec::new();
+        for (entry, id) in chunk {
+            let state_clone = (*state).clone();
+            let sess_clone = sess.clone();
+            let entry = entry.clone();
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                let detail_path = format!("/entries/{}?view=true", urlencoding::encode(&id));
+                (
+                    entry,
+                    id,
+                    api_get(&state_clone, &sess_clone, &detail_path).await,
+                )
+            }));
+        }
+
+        for handle in handles {
+            let Ok((entry, id, result)) = handle.await else {
+                content_scan_errors += 1;
+                continue;
+            };
+            match result {
+                Ok(detail) => {
+                    content_entries_scanned += 1;
+                    if value_contains_text(&detail, &query) {
+                        seen.insert(id);
+                        let mut matched = entry;
+                        set_match_source(&mut matched, "content");
+                        matches.push(matched);
+                        content_match_count += 1;
+                    }
+                }
+                Err(e) if e == RECONNECT_ERROR => return Err(e),
+                Err(_) => {
+                    content_scan_errors += 1;
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "entries": matches,
+        "search_strategy": "title_then_bounded_content",
+        "title_match_count": title_match_count,
+        "content_match_count": content_match_count,
+        "content_entries_scanned": content_entries_scanned,
+        "content_search_limit": ENTRY_CONTENT_SEARCH_LIMIT,
+        "content_search_truncated": content_search_truncated,
+        "content_scan_errors": content_scan_errors,
+    }))
 }
 
 async fn search_dna_sequences(state: &AppState, params: &Value) -> Result<Value, String> {
@@ -458,6 +578,41 @@ fn filter_by_name(items: Vec<Value>, query: &str) -> Vec<Value> {
         .collect()
 }
 
+fn set_match_source(item: &mut Value, source: &str) {
+    if let Value::Object(map) = item {
+        map.insert(
+            "match_source".to_string(),
+            Value::String(source.to_string()),
+        );
+    }
+}
+
+fn value_contains_text(value: &Value, query: &str) -> bool {
+    let needle = query.trim().to_lowercase();
+    !needle.is_empty() && value_contains_lowercase_text(value, &needle)
+}
+
+fn value_contains_lowercase_text(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(s) => s.to_lowercase().contains(needle),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_contains_lowercase_text(item, needle)),
+        Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| !is_search_noise_key(key))
+            .any(|(_, item)| value_contains_lowercase_text(item, needle)),
+        _ => false,
+    }
+}
+
+fn is_search_noise_key(key: &str) -> bool {
+    matches!(
+        key,
+        "url" | "editURL" | "webURL" | "webUrl" | "owner_url" | "avatar_url" | "apiURL" | "apiUrl"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,10 +650,57 @@ mod tests {
     }
 
     #[test]
+    fn normalize_project_surfaces_lib_id_for_get_roundtrip() {
+        // Regression: list_projects returned the raw numeric `id`, but get_project
+        // hits /folders/{id} which only accepts the `lib_…` api_identifier, so the
+        // agent's list->get round-trip 404'd. normalize_project must surface the
+        // lib_ id as `id` (numeric preserved as db_id).
+        let raw = json!({ "id": 8160812, "api_identifier": "lib_abc", "name": "Cancer Genomics" });
+        let n = normalize_project(raw);
+        assert_eq!(n.get("id").and_then(|v| v.as_str()), Some("lib_abc"));
+        assert_eq!(n.get("db_id").and_then(|v| v.as_i64()), Some(8160812));
+        assert_eq!(
+            n.get("name").and_then(|v| v.as_str()),
+            Some("Cancer Genomics")
+        );
+    }
+
+    #[test]
     fn name_filter_is_case_insensitive_contains() {
         assert!(name_contains("My Plasmid Library", "plasmid"));
         assert!(name_contains("PCR-01", "pcr"));
         assert!(!name_contains("Genome", "plasmid"));
+    }
+
+    #[test]
+    fn value_contains_text_matches_nested_entry_content() {
+        let entry = json!({
+            "entryDays": [
+                {
+                    "body": {
+                        "blocks": [
+                            { "text": "Negative control looked clean." },
+                            { "text": "Observed TP53 induction after treatment." }
+                        ]
+                    }
+                }
+            ],
+            "webURL": "https://benchling.com/acme/f_/not-content"
+        });
+
+        assert!(value_contains_text(&entry, "tp53 induction"));
+        assert!(!value_contains_text(&entry, "missing-term"));
+    }
+
+    #[test]
+    fn value_contains_text_ignores_url_noise() {
+        let entry = json!({
+            "name": "Body-only probe",
+            "webURL": "https://benchling.com/acme/f_/TP53-url-only",
+            "entryDays": [{ "body": { "blocks": [{ "text": "No gene mention here." }] } }]
+        });
+
+        assert!(!value_contains_text(&entry, "tp53-url-only"));
     }
 
     #[test]
