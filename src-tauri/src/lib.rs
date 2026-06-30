@@ -24,6 +24,12 @@ pub fn ws_url() -> String {
     }
 }
 
+fn spawn_benchling_liveness(app_handle: tauri::AppHandle, state: AppState) {
+    tauri::async_runtime::spawn(session::benchling::watch_session_liveness(
+        app_handle, state,
+    ));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Default to showing info-level logs in dev mode
@@ -38,7 +44,10 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(app_state.clone())
@@ -94,18 +103,6 @@ pub fn run() {
             #[cfg(debug_assertions)]
             tray::show_settings_window(app.handle());
 
-            // Keep the live Benchling session status honest: a background task
-            // detects when the captured session dies (idle/expired/logout) and
-            // flips the UI + backend to "not connected".
-            {
-                let app_handle = app.handle().clone();
-                let liveness_state = app_state.clone();
-                tauri::async_runtime::spawn(session::benchling::watch_session_liveness(
-                    app_handle,
-                    liveness_state,
-                ));
-            }
-
             // Auto-connect if we have a stored device token
             // (In dev mode without a token, the frontend will handle connection)
             if has_stored_token {
@@ -125,23 +122,47 @@ pub fn run() {
                         }
                     }
 
-                    // Brief delay to let state initialization complete
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    {
+                        let ws_app = app_handle.clone();
+                        let ws_state = state_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            // Brief delay to let state initialization complete
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                    let ws_url = ws_url();
-                    let client = ws::WsClient::new(app_handle, state_clone, ws_url);
-                    client.run().await;
+                            let ws_url = ws_url();
+                            let client = ws::WsClient::new(ws_app, ws_state, ws_url);
+                            client.run().await;
+                        });
+                    }
+
+                    let restored = session::benchling::restore_session_on_startup(
+                        app_handle.clone(),
+                        state_clone.clone(),
+                    )
+                    .await;
+                    if restored {
+                        log::info!("Benchling startup session restore succeeded");
+                    }
+
+                    spawn_benchling_liveness(app_handle, state_clone);
                 });
-            } else if cfg!(debug_assertions) {
-                log::info!("Dev mode: auto-connecting WebSocket client");
-                let app_handle = app.handle().clone();
-                let state_clone = app_state.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let ws_url = ws_url();
-                    let client = ws::WsClient::new(app_handle, state_clone, ws_url);
-                    client.run().await;
-                });
+            } else {
+                // With no stored token there is nothing to restore yet, but keep
+                // the liveness watcher alive so a later pairing/login flow is
+                // monitored without needing an app restart.
+                spawn_benchling_liveness(app.handle().clone(), app_state.clone());
+
+                if cfg!(debug_assertions) {
+                    log::info!("Dev mode: auto-connecting WebSocket client");
+                    let app_handle = app.handle().clone();
+                    let state_clone = app_state.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let ws_url = ws_url();
+                        let client = ws::WsClient::new(app_handle, state_clone, ws_url);
+                        client.run().await;
+                    });
+                }
             }
 
             Ok(())

@@ -11,8 +11,16 @@ const STORE_FILE: &str = "settings.json";
 
 /// Store a fresh auth token from the frontend.
 #[tauri::command]
-pub async fn set_auth_token(state: State<'_, AppState>, token: String) -> Result<(), String> {
+pub async fn set_auth_token(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<(), String> {
+    let state_clone = (*state).clone();
     *state.auth_token.write().await = Some(token);
+    tauri::async_runtime::spawn(async move {
+        crate::session::benchling::register_current_session_with_backend(&app, &state_clone).await;
+    });
     Ok(())
 }
 
@@ -20,7 +28,10 @@ pub async fn set_auth_token(state: State<'_, AppState>, token: String) -> Result
 #[tauri::command]
 pub async fn connect_ws(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let current = state.ws_status.read().await.clone();
-    if matches!(current, ConnectionStatus::Connected | ConnectionStatus::Connecting | ConnectionStatus::Reconnecting) {
+    if matches!(
+        current,
+        ConnectionStatus::Connected | ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
+    ) {
         return Ok(());
     }
 
@@ -53,7 +64,9 @@ pub async fn disconnect_ws(state: State<'_, AppState>) -> Result<(), String> {
 
 /// Get current connection status.
 #[tauri::command]
-pub async fn get_connection_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn get_connection_status(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     let status = state.ws_status.read().await.clone();
     let device_id = state.device_id.read().await.clone();
 
@@ -107,9 +120,13 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let autostart = app.autolaunch();
     if enabled {
-        autostart.enable().map_err(|e| format!("Failed to enable autostart: {e}"))
+        autostart
+            .enable()
+            .map_err(|e| format!("Failed to enable autostart: {e}"))
     } else {
-        autostart.disable().map_err(|e| format!("Failed to disable autostart: {e}"))
+        autostart
+            .disable()
+            .map_err(|e| format!("Failed to disable autostart: {e}"))
     }
 }
 
@@ -188,7 +205,10 @@ pub async fn claim_pairing_code(
         .map_err(|e| format!("Request failed: {e}"))?;
 
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| format!("Failed to read response: {e}"))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {e}"))?;
 
     if !status.is_success() {
         // Try to extract detail from JSON response
@@ -200,8 +220,8 @@ pub async fn claim_pairing_code(
         return Err(format!("Pairing failed (HTTP {})", status));
     }
 
-    let result: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("Invalid response: {e}"))?;
+    let result: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid response: {e}"))?;
 
     let device_token = result
         .get("device_token")
@@ -216,6 +236,8 @@ pub async fn claim_pairing_code(
 
     // Device is now paired — reflect that in the tray menu label.
     crate::tray::update_tray_pairing(&app, true);
+
+    crate::session::benchling::register_current_session_with_backend(&app, &state).await;
 
     // NOTE: we deliberately do NOT force a reconnect here, and that is correct
     // for production. Pairing is reached from the PairingScreen, which only shows

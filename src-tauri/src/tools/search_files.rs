@@ -15,27 +15,31 @@ use crate::unicode;
 /// - `search_content` (bool, optional): Search inside file contents
 /// - `file_types` (array of strings, optional): Filter by extension
 /// - `limit` (integer, optional): Max results (default 20)
-pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, Option<u64>), String> {
-    let query = params.get("query")
+pub async fn handle(
+    params: Value,
+    scoped_folders: &[String],
+) -> Result<(Value, Option<u64>), String> {
+    let query = params
+        .get("query")
         .and_then(|v| v.as_str())
         .ok_or("search_files requires 'query' parameter")?;
 
-    let search_content = params.get("search_content")
+    let search_content = params
+        .get("search_content")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let limit = params.get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
-    let file_types: Option<Vec<String>> = params.get("file_types")
+    let file_types: Option<Vec<String>> = params
+        .get("file_types")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     // Determine search roots
-    let search_roots: Vec<String> = if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
+    let search_roots: Vec<String> = if let Some(path) = params.get("path").and_then(|v| v.as_str())
+    {
         // Validate the specified path
-        security::validate_path(path, scoped_folders)
-            .map_err(|e| e.to_string())?;
+        security::validate_path(path, scoped_folders).map_err(|e| e.to_string())?;
         vec![path.to_string()]
     } else {
         // Search all scoped folders
@@ -76,7 +80,8 @@ pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, 
 
             // Filter by file type if specified
             if let Some(ref types) = file_types {
-                let ext = entry_path.extension()
+                let ext = entry_path
+                    .extension()
                     .map(|e| e.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
                 if !types.iter().any(|t| t.to_lowercase() == ext) {

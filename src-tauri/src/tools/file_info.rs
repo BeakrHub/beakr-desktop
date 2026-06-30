@@ -6,22 +6,25 @@ use crate::security;
 ///
 /// Params:
 /// - `path` (string, required): File path to inspect
-pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, Option<u64>), String> {
-    let path = params.get("path")
+pub async fn handle(
+    params: Value,
+    scoped_folders: &[String],
+) -> Result<(Value, Option<u64>), String> {
+    let path = params
+        .get("path")
         .and_then(|v| v.as_str())
         .ok_or("file_info requires 'path' parameter")?;
 
     // Validate path
-    let canonical = security::validate_path(path, scoped_folders)
-        .map_err(|e| e.to_string())?;
+    let canonical = security::validate_path(path, scoped_folders).map_err(|e| e.to_string())?;
 
     // Check deny list
     if security::is_denied(&canonical) {
         return Err(format!("Access denied — sensitive file: {path}"));
     }
 
-    let metadata = std::fs::metadata(&canonical)
-        .map_err(|e| format!("Cannot read file metadata: {e}"))?;
+    let metadata =
+        std::fs::metadata(&canonical).map_err(|e| format!("Cannot read file metadata: {e}"))?;
 
     let file_type = if metadata.is_dir() {
         "directory"
@@ -31,29 +34,32 @@ pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, 
         "file"
     };
 
-    let modified_at = metadata.modified().ok().map(|t| {
-        chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
-    });
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
 
     let permissions = format_permissions(&metadata);
 
-    let is_readable = canonical.exists()
-        && std::fs::File::open(&canonical).is_ok();
+    let is_readable = canonical.exists() && std::fs::File::open(&canonical).is_ok();
 
     let file_name = canonical
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    Ok((json!({
-        "name": file_name,
-        "path": canonical.display().to_string(),
-        "size": metadata.len(),
-        "type": file_type,
-        "modified_at": modified_at,
-        "permissions": permissions,
-        "is_readable": is_readable,
-    }), None))
+    Ok((
+        json!({
+            "name": file_name,
+            "path": canonical.display().to_string(),
+            "size": metadata.len(),
+            "type": file_type,
+            "modified_at": modified_at,
+            "permissions": permissions,
+            "is_readable": is_readable,
+        }),
+        None,
+    ))
 }
 
 /// Format file permissions in a cross-platform way.

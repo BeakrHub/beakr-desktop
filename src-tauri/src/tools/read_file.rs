@@ -1,6 +1,6 @@
 use std::io::{BufReader, Read};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 
 use crate::security;
@@ -14,18 +14,22 @@ const BINARY_CHECK_SIZE: usize = 8192;
 /// - `path` (string, required): File to read
 /// - `encoding` (string, optional): Text encoding (default "utf-8")
 /// - `max_lines` (integer, optional): Limit lines returned
-pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, Option<u64>), String> {
-    let path = params.get("path")
+pub async fn handle(
+    params: Value,
+    scoped_folders: &[String],
+) -> Result<(Value, Option<u64>), String> {
+    let path = params
+        .get("path")
         .and_then(|v| v.as_str())
         .ok_or("read_file requires 'path' parameter")?;
 
-    let max_lines = params.get("max_lines")
+    let max_lines = params
+        .get("max_lines")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
 
     // Validate path
-    let canonical = security::validate_path(path, scoped_folders)
-        .map_err(|e| e.to_string())?;
+    let canonical = security::validate_path(path, scoped_folders).map_err(|e| e.to_string())?;
 
     // Check deny list
     if security::is_denied(&canonical) {
@@ -33,8 +37,7 @@ pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, 
     }
 
     // Check file size
-    let metadata = std::fs::metadata(&canonical)
-        .map_err(|e| format!("Cannot read file: {e}"))?;
+    let metadata = std::fs::metadata(&canonical).map_err(|e| format!("Cannot read file: {e}"))?;
 
     if metadata.len() > MAX_FILE_SIZE {
         return Err(format!(
@@ -48,20 +51,20 @@ pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, 
     }
 
     // Binary detection: check first 8KB for null bytes
-    let file = std::fs::File::open(&canonical)
-        .map_err(|e| format!("Cannot open file: {e}"))?;
+    let file = std::fs::File::open(&canonical).map_err(|e| format!("Cannot open file: {e}"))?;
 
     let mut reader = BufReader::new(file);
     let mut check_buf = vec![0u8; BINARY_CHECK_SIZE];
-    let bytes_read = reader.read(&mut check_buf)
+    let bytes_read = reader
+        .read(&mut check_buf)
         .map_err(|e| format!("Read error: {e}"))?;
 
     let is_binary = check_buf[..bytes_read].contains(&0);
 
     if is_binary {
         // Binary file: read raw bytes and return base64-encoded
-        let raw_bytes = std::fs::read(&canonical)
-            .map_err(|e| format!("Cannot read binary file: {e}"))?;
+        let raw_bytes =
+            std::fs::read(&canonical).map_err(|e| format!("Cannot read binary file: {e}"))?;
         let bytes_transferred = raw_bytes.len() as u64;
         let encoded = BASE64.encode(&raw_bytes);
 
@@ -86,5 +89,8 @@ pub async fn handle(params: Value, scoped_folders: &[String]) -> Result<(Value, 
         None => content,
     };
 
-    Ok((json!({ "content": content, "encoding": "utf-8" }), Some(bytes_transferred)))
+    Ok((
+        json!({ "content": content, "encoding": "utf-8" }),
+        Some(bytes_transferred),
+    ))
 }

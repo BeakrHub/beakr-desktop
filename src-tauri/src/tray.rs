@@ -27,8 +27,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     // Default to the unpaired label; lib.rs updates it from the stored token at
     // startup, and claim_pairing_code/clear_token update it as pairing changes.
-    let settings_item = MenuItemBuilder::with_id("settings", "Pair device")
-        .build(app)?;
+    let settings_item = MenuItemBuilder::with_id("settings", "Pair device").build(app)?;
 
     // Store the menu item handles so we can update them at runtime.
     app.manage(TrayState {
@@ -36,8 +35,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         settings_item: settings_item.clone(),
     });
 
-    let quit_item = MenuItemBuilder::with_id("quit", "Quit Beakr")
-        .build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "Quit Beakr").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&status_item)
@@ -51,16 +49,14 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .icon(app.default_window_icon().cloned().unwrap())
         .menu(&menu)
         .tooltip("Beakr Desktop")
-        .on_menu_event(move |app, event| {
-            match event.id().as_ref() {
-                "settings" => {
-                    show_settings_window(app);
-                }
-                "quit" => {
-                    app.exit(0);
-                }
-                _ => {}
+        .on_menu_event(move |app, event| match event.id().as_ref() {
+            "settings" => {
+                show_settings_window(app);
             }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
         })
         .build(app)?;
 
@@ -114,7 +110,11 @@ pub fn update_tray_status(app: &AppHandle, status: &ConnectionStatus) {
 /// Unpaired -> "Pair device" (the window opens on the pairing screen); paired ->
 /// "Open Beakr". The click action is unchanged; only the label adapts.
 pub fn update_tray_pairing(app: &AppHandle, is_paired: bool) {
-    let label = if is_paired { "Open Beakr" } else { "Pair device" };
+    let label = if is_paired {
+        "Open Beakr"
+    } else {
+        "Pair device"
+    };
     if let Some(tray_state) = app.try_state::<TrayState>() {
         let _ = tray_state.settings_item.set_text(label);
     }

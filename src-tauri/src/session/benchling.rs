@@ -29,9 +29,14 @@ use crate::state::{AppState, BenchlingSession};
 const LOGIN_WATCH_TIMEOUT: Duration = Duration::from_secs(600);
 /// Interval between cookie/probe polls while waiting for login.
 const LOGIN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// How long startup should wait for the persisted webview cookie store to load.
+const STARTUP_RESTORE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Interval between startup cookie/probe polls.
+const STARTUP_RESTORE_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 const BENCHLING_ORIGIN: &str = "https://benchling.com";
 const TENANT_HOST: &str = "benchling.com";
+const RESTORE_WINDOW_LABEL: &str = "session-benchling-restore";
 
 /// Derive the Beakr backend API base from the WS URL (mirrors `claim_pairing_code`).
 fn api_base() -> String {
@@ -132,14 +137,90 @@ async fn register_connector(token: &str, user_handle: &str) -> Result<(), String
     Ok(())
 }
 
+/// Register the currently captured Benchling session with Beakr, if possible.
+///
+/// This is intentionally best-effort: the local Benchling tools can still work
+/// with a captured cookie even if the backend registration is temporarily down.
+pub async fn register_current_session_with_backend(app: &AppHandle, state: &AppState) {
+    let session = { state.benchling_session.read().await.clone() };
+    let token = { state.auth_token.read().await.clone() };
+
+    let (Some(session), Some(token)) = (session, token) else {
+        return;
+    };
+    if token.is_empty() {
+        return;
+    }
+
+    if let Err(e) = register_connector(&token, &session.user_handle).await {
+        log::warn!("Benchling connector registration failed: {e}");
+        let _ = app.emit(
+            "session:error",
+            serde_json::json!({
+                "provider": "benchling",
+                "message": format!(
+                    "Connected to Benchling, but registering with Beakr failed: {e}"
+                ),
+            }),
+        );
+    }
+}
+
+/// Captures a valid Benchling session from a webview, registers it with Beakr,
+/// and emits the frontend connected event.
+async fn capture_valid_session(
+    app: &AppHandle,
+    state: &AppState,
+    window_label: &str,
+) -> Result<Option<String>, String> {
+    let Some(cookie) = read_session_cookie(app, window_label) else {
+        return Ok(None);
+    };
+
+    let Some(handle) = probe_users_me(&cookie).await? else {
+        return Ok(None);
+    };
+
+    // Capture the session for the live agent tools.
+    *state.benchling_session.write().await = Some(BenchlingSession {
+        session_cookie: cookie,
+        tenant_host: TENANT_HOST.to_string(),
+        user_handle: handle.clone(),
+    });
+
+    // Register the connector + this device with the backend so the agent's tools
+    // can RPC here. A missing device token is a non-fatal warning: the session is
+    // still captured locally, and registration is retried when a token is set.
+    if state
+        .auth_token
+        .read()
+        .await
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
+    {
+        register_current_session_with_backend(app, state).await;
+    } else {
+        log::warn!("Benchling connected but no device token — pair this device with Beakr first");
+    }
+
+    let _ = app.emit(
+        "session:connected",
+        serde_json::json!({
+            "provider": "benchling",
+            "user_handle": handle,
+            "tenant_host": TENANT_HOST,
+        }),
+    );
+    log::info!("Benchling session connected for handle={handle}");
+    Ok(Some(handle))
+}
+
 /// Polls the open benchling webview until the user is logged in, then captures the
 /// session, registers the connector, and emits `session:connected`.
 ///
 /// Idempotent and self-terminating: returns once connected, after the timeout, or
 /// once the captured session is already set (a prior connect succeeded).
 pub async fn watch_for_login(app: AppHandle, state: AppState, window_label: String) {
-    let token = state.auth_token.read().await.clone();
-
     let deadline = tokio::time::Instant::now() + LOGIN_WATCH_TIMEOUT;
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -152,65 +233,97 @@ pub async fn watch_for_login(app: AppHandle, state: AppState, window_label: Stri
             return;
         }
 
-        if let Some(cookie) = read_session_cookie(&app, &window_label) {
-            match probe_users_me(&cookie).await {
-                Ok(Some(handle)) => {
-                    // Capture the session for the live agent tools.
-                    *state.benchling_session.write().await = Some(BenchlingSession {
-                        session_cookie: cookie,
-                        tenant_host: TENANT_HOST.to_string(),
-                        user_handle: handle.clone(),
-                    });
-
-                    // Register the connector + this device with the backend so the
-                    // agent's tools can RPC here. A missing device token is a
-                    // non-fatal warning: the session is still captured locally, and
-                    // the user just needs to pair the device.
-                    match token.as_deref() {
-                        Some(t) if !t.is_empty() => {
-                            if let Err(e) = register_connector(t, &handle).await {
-                                log::warn!("Benchling connector registration failed: {e}");
-                                let _ = app.emit(
-                                    "session:error",
-                                    serde_json::json!({
-                                        "provider": "benchling",
-                                        "message": format!(
-                                            "Connected to Benchling, but registering with Beakr failed: {e}"
-                                        ),
-                                    }),
-                                );
-                                // Still report connected: the local session works;
-                                // registration can be retried by reconnecting.
-                            }
-                        }
-                        _ => {
-                            log::warn!(
-                                "Benchling connected but no device token — pair this device with Beakr first"
-                            );
-                        }
-                    }
-
-                    let _ = app.emit(
-                        "session:connected",
-                        serde_json::json!({
-                            "provider": "benchling",
-                            "user_handle": handle,
-                            "tenant_host": TENANT_HOST,
-                        }),
-                    );
-                    log::info!("Benchling session connected for handle={handle}");
-                    return;
-                }
-                Ok(None) => {
-                    // Not logged in yet — keep waiting.
-                }
-                Err(e) => {
-                    log::debug!("Benchling users/me probe error (will retry): {e}");
-                }
+        match capture_valid_session(&app, &state, &window_label).await {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                // Not logged in yet — keep waiting.
+            }
+            Err(e) => {
+                log::debug!("Benchling users/me probe error (will retry): {e}");
             }
         }
 
         tokio::time::sleep(LOGIN_POLL_INTERVAL).await;
+    }
+}
+
+fn close_restore_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(RESTORE_WINDOW_LABEL) {
+        let _ = window.close();
+    }
+}
+
+fn open_restore_window(app: &AppHandle) -> Result<(), String> {
+    if app.get_webview_window(RESTORE_WINDOW_LABEL).is_some() {
+        return Ok(());
+    }
+
+    let url = Url::parse(BENCHLING_ORIGIN).map_err(|e| format!("invalid Benchling URL: {e}"))?;
+    tauri::WebviewWindowBuilder::new(app, RESTORE_WINDOW_LABEL, tauri::WebviewUrl::External(url))
+        .title("Benchling session restore")
+        .inner_size(640.0, 480.0)
+        .resizable(false)
+        .visible(false)
+        .skip_taskbar(true)
+        .build()
+        .map_err(|e| format!("failed to open hidden Benchling restore window: {e}"))?;
+
+    Ok(())
+}
+
+/// Restores a previously connected Benchling session from the webview cookie
+/// store on app startup.
+///
+/// The Benchling `session` cookie itself remains in the OS/webview cookie store;
+/// Beakr only rehydrates its in-memory copy after validating it with
+/// `/1/api/users/me`. This prevents the liveness task from immediately marking a
+/// healthy backend connector as disconnected just because the app process
+/// restarted.
+pub async fn restore_session_on_startup(app: AppHandle, state: AppState) -> bool {
+    if state.benchling_session.read().await.is_some() {
+        return true;
+    }
+
+    let manual_window_label = "session-benchling";
+    let label = if app.get_webview_window(manual_window_label).is_some() {
+        manual_window_label
+    } else {
+        match open_restore_window(&app) {
+            Ok(()) => RESTORE_WINDOW_LABEL,
+            Err(e) => {
+                log::debug!("Benchling startup restore skipped: {e}");
+                return false;
+            }
+        }
+    };
+
+    let deadline = tokio::time::Instant::now() + STARTUP_RESTORE_TIMEOUT;
+    loop {
+        match capture_valid_session(&app, &state, label).await {
+            Ok(Some(handle)) => {
+                if label == RESTORE_WINDOW_LABEL {
+                    close_restore_window(&app);
+                }
+                log::info!("Restored Benchling session on startup for handle={handle}");
+                return true;
+            }
+            Ok(None) => {
+                // Cookie store not ready yet, or the user is not logged in.
+            }
+            Err(e) => {
+                log::debug!("Benchling startup restore probe error (will retry): {e}");
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            if label == RESTORE_WINDOW_LABEL {
+                close_restore_window(&app);
+            }
+            log::info!("No valid Benchling session found during startup restore");
+            return false;
+        }
+
+        tokio::time::sleep(STARTUP_RESTORE_POLL_INTERVAL).await;
     }
 }
 
@@ -250,8 +363,10 @@ pub async fn watch_session_liveness(app: AppHandle, state: AppState) {
                 // token has not been loaded into state yet.
                 if needs_report {
                     if let Some(token) = state.auth_token.read().await.clone() {
-                        let _ = app
-                            .emit("session:disconnected", serde_json::json!({ "provider": "benchling" }));
+                        let _ = app.emit(
+                            "session:disconnected",
+                            serde_json::json!({ "provider": "benchling" }),
+                        );
                         report_disconnect(&token).await;
                         needs_report = false;
                     }
@@ -264,8 +379,10 @@ pub async fn watch_session_liveness(app: AppHandle, state: AppState) {
                     // 401 — the session expired or the user logged out.
                     *state.benchling_session.write().await = None;
                     if needs_report {
-                        let _ = app
-                            .emit("session:disconnected", serde_json::json!({ "provider": "benchling" }));
+                        let _ = app.emit(
+                            "session:disconnected",
+                            serde_json::json!({ "provider": "benchling" }),
+                        );
                         if let Some(token) = state.auth_token.read().await.clone() {
                             report_disconnect(&token).await;
                         }
