@@ -66,6 +66,9 @@ const ENTRY_CONTENT_SEARCH_CONCURRENCY: usize = 8;
 enum ItemKind {
     Entry,
     Sequence,
+    Protocol,
+    AaSequence,
+    File,
     CustomEntity,
 }
 
@@ -73,12 +76,22 @@ fn classify_id(id: &str) -> ItemKind {
     if id.starts_with("etr_") {
         ItemKind::Entry
     } else if id.starts_with("seq_") {
+        // DNA/RNA sequences and oligos share the seq_ prefix; both surface through
+        // the DNA-sequence tools. get-nested-files exposes only id+name, so there
+        // is no field to split oligos out without a per-item detail fetch.
         ItemKind::Sequence
+    } else if id.starts_with("prtn_") {
+        // AA / protein sequences. Confirmed live 2026-06-30: an AA sequence created
+        // in Benchling gets a prtn_ id. This branch must precede no others that
+        // could swallow it; without it prtn_ falls through to CustomEntity and
+        // proteins are silently mislabeled as custom entities.
+        ItemKind::AaSequence
+    } else if id.starts_with("prt_") {
+        ItemKind::Protocol
+    } else if id.starts_with("file_") {
+        ItemKind::File
     } else {
-        // Everything that is not an entry, protocol, or sequence/file is treated
-        // as a custom entity for the purposes of the custom-entity tools. Files
-        // (`file_`) and protocols (`prt_`) are intentionally not surfaced by the
-        // custom-entity tools, so they are excluded explicitly below.
+        // Anything else (e.g. bfi_ registry ids) is a custom entity.
         ItemKind::CustomEntity
     }
 }
@@ -103,6 +116,15 @@ pub async fn dispatch(
         "benchling_search_entries" => search_entries(state, &params).await?,
         "benchling_search_dna_sequences" => search_dna_sequences(state, &params).await?,
         "benchling_search_custom_entities" => search_custom_entities(state, &params).await?,
+        "benchling_list_protocols" => list_protocols(state, &params).await?,
+        "benchling_get_protocol" => get_protocol(state, &params).await?,
+        "benchling_search_protocols" => search_protocols(state, &params).await?,
+        "benchling_list_aa_sequences" => list_aa_sequences(state, &params).await?,
+        "benchling_get_aa_sequence" => get_aa_sequence(state, &params).await?,
+        "benchling_search_aa_sequences" => search_aa_sequences(state, &params).await?,
+        "benchling_list_files" => list_files(state, &params).await?,
+        "benchling_get_file" => get_file(state, &params).await?,
+        "benchling_search_files" => search_files(state, &params).await?,
         other => return Err(format!("Unknown Benchling tool: {other}")),
     };
     Ok((data, None))
@@ -174,9 +196,12 @@ async fn api_get(state: &AppState, sess: &BenchlingSession, path: &str) -> Resul
 }
 
 /// Recursively rewrites Benchling's relative URL fields (`url`, `editURL`,
-/// `webURL`, `owner_url`) to absolute `https://<host>/...`, stripping a trailing
-/// `/edit` so links open the view (not the editor). Absolute values (e.g.
-/// `avatar_url` on a CDN) are left untouched since they do not start with `/`.
+/// `webURL`, `owner_url`) to absolute `https://<host>/...`. The path is kept
+/// exactly as Benchling provides it, including a trailing `/edit`: on path-handle
+/// (free-tier) tenants the non-`/edit` form 404s, so `/edit` is the URL that
+/// actually resolves (verified live against a david-beakr sequence). Absolute
+/// values (e.g. `avatar_url` on a CDN) are left untouched since they do not
+/// start with `/`.
 fn absolutize_urls(value: &mut Value, host: &str) {
     match value {
         Value::Object(map) => {
@@ -184,8 +209,7 @@ fn absolutize_urls(value: &mut Value, host: &str) {
                 if matches!(k.as_str(), "url" | "editURL" | "webURL" | "owner_url") {
                     if let Value::String(s) = v {
                         if s.starts_with('/') {
-                            let path = s.strip_suffix("/edit").unwrap_or(s).to_string();
-                            *s = format!("https://{host}{path}");
+                            *s = format!("https://{host}{s}");
                         }
                         continue;
                     }
@@ -337,11 +361,10 @@ async fn collect_items(
             if id.is_empty() || seen.contains(&id) {
                 continue;
             }
-            // Files and protocols are never surfaced as custom entities.
-            if kind == ItemKind::CustomEntity && (id.starts_with("file_") || id.starts_with("prt_"))
-            {
-                continue;
-            }
+            // Every non-custom-entity kind (entry, sequence, protocol, AA sequence,
+            // file) now has its own ItemKind, so the prefix check below is the only
+            // filter needed: anything that is not the requested kind is skipped, and
+            // only unprefixed/registry ids fall through to CustomEntity.
             if classify_id(&id) != kind {
                 continue;
             }
@@ -548,6 +571,102 @@ async fn search_custom_entities(state: &AppState, params: &Value) -> Result<Valu
     Ok(json!({ "custom_entities": filter_by_name(entities, &query) }))
 }
 
+// ---- protocol handlers ------------------------------------------------------
+//
+// Protocols are returned by `get-nested-files` like any other project content
+// (id prefix `prt_`), so list/search reuse the same `collect_items` path as
+// entries and sequences. This closes the gap behind "Beakr finds my project but
+// not the protocol inside it" — e.g. a recipe stored as a Benchling Protocol.
+
+async fn list_protocols(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let project_id = optional_str(params, "project_id");
+    let protocols = collect_items(state, &sess, project_id.as_deref(), ItemKind::Protocol).await?;
+    Ok(json!({ "protocols": protocols }))
+}
+
+async fn get_protocol(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let id = require_str(params, "protocol_id")?;
+    api_get(
+        state,
+        &sess,
+        &format!("/protocols/{}", urlencoding::encode(&id)),
+    )
+    .await
+}
+
+async fn search_protocols(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let query = require_str(params, "query")?;
+    let protocols = collect_items(state, &sess, None, ItemKind::Protocol).await?;
+    Ok(json!({ "protocols": filter_by_name(protocols, &query) }))
+}
+
+// ---- AA sequence handlers ---------------------------------------------------
+//
+// AA / protein sequences carry the prtn_ id prefix (confirmed live 2026-06-30).
+// They come back from get-nested-files alongside other content; before this they
+// fell through classify_id to CustomEntity and were mislabeled as custom entities.
+
+async fn list_aa_sequences(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let project_id = optional_str(params, "project_id");
+    let sequences =
+        collect_items(state, &sess, project_id.as_deref(), ItemKind::AaSequence).await?;
+    Ok(json!({ "aa_sequences": sequences }))
+}
+
+async fn get_aa_sequence(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let id = require_str(params, "aa_sequence_id")?;
+    api_get(
+        state,
+        &sess,
+        &format!("/aa-sequences/{}", urlencoding::encode(&id)),
+    )
+    .await
+}
+
+async fn search_aa_sequences(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let query = require_str(params, "query")?;
+    let sequences = collect_items(state, &sess, None, ItemKind::AaSequence).await?;
+    Ok(json!({ "aa_sequences": filter_by_name(sequences, &query) }))
+}
+
+// ---- file handlers ----------------------------------------------------------
+//
+// Uploaded files carry the file_ id prefix and are returned by get-nested-files.
+// They were previously dropped (never surfaced by any tool). The get-file detail
+// endpoint (`/files/{id}`) is the documented internal path; live-verify against a
+// real file_ id. list/search ride get-nested-files and work regardless.
+
+async fn list_files(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let project_id = optional_str(params, "project_id");
+    let files = collect_items(state, &sess, project_id.as_deref(), ItemKind::File).await?;
+    Ok(json!({ "files": files }))
+}
+
+async fn get_file(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let id = require_str(params, "file_id")?;
+    api_get(
+        state,
+        &sess,
+        &format!("/files/{}", urlencoding::encode(&id)),
+    )
+    .await
+}
+
+async fn search_files(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let query = require_str(params, "query")?;
+    let files = collect_items(state, &sess, None, ItemKind::File).await?;
+    Ok(json!({ "files": filter_by_name(files, &query) }))
+}
+
 // ---- param + filter utilities ----------------------------------------------
 
 fn require_str(params: &Value, key: &str) -> Result<String, String> {
@@ -621,8 +740,38 @@ mod tests {
     fn classify_id_maps_prefixes() {
         assert_eq!(classify_id("etr_abc"), ItemKind::Entry);
         assert_eq!(classify_id("seq_abc"), ItemKind::Sequence);
-        // A custom-entity-style id (no entry/sequence prefix) is a custom entity.
+        assert_eq!(classify_id("prt_abc"), ItemKind::Protocol);
+        assert_eq!(classify_id("prtn_abc"), ItemKind::AaSequence);
+        assert_eq!(classify_id("file_abc"), ItemKind::File);
+        // A registry-style id (no known prefix) is a custom entity.
         assert_eq!(classify_id("bfi_abc"), ItemKind::CustomEntity);
+    }
+
+    #[test]
+    fn classify_id_does_not_confuse_protocol_and_aa_sequence() {
+        // prt_ (protocol) and prtn_ (AA sequence) share a leading "prt"; the
+        // classifier must keep them distinct or proteins leak into protocols.
+        assert_eq!(classify_id("prt_9elVn4zgKN"), ItemKind::Protocol);
+        assert_eq!(classify_id("prtn_ID7vHq6T6D"), ItemKind::AaSequence);
+    }
+
+    #[test]
+    fn dispatch_routes_new_type_tools() {
+        // The protocol/AA/file tools must be reachable through the central prefix
+        // router; a missing arm would surface as "Unknown Benchling tool" at runtime.
+        for tool in [
+            "benchling_list_protocols",
+            "benchling_get_protocol",
+            "benchling_search_protocols",
+            "benchling_list_aa_sequences",
+            "benchling_get_aa_sequence",
+            "benchling_search_aa_sequences",
+            "benchling_list_files",
+            "benchling_get_file",
+            "benchling_search_files",
+        ] {
+            assert!(handles(tool), "{tool} not handled");
+        }
     }
 
     #[test]
@@ -639,6 +788,24 @@ mod tests {
         // No array anywhere -> empty.
         let none = json!({ "n": 1 });
         assert!(pick_array(&none, &["files"]).is_empty());
+    }
+
+    #[test]
+    fn absolutize_urls_preserves_edit_suffix() {
+        // Regression: Benchling returns the item link as a relative editURL ending
+        // in `/edit`. The non-/edit form 404s on path-handle (free-tier) tenants, so
+        // the suffix must be preserved (it was previously stripped -> dead link).
+        let mut v = json!({
+            "editURL": "/david-beakr/f/lib_1-proj/seq_1-scramble/edit",
+            "avatar_url": "https://cdn.example.com/x.png",
+        });
+        absolutize_urls(&mut v, "benchling.com");
+        assert_eq!(
+            v["editURL"],
+            json!("https://benchling.com/david-beakr/f/lib_1-proj/seq_1-scramble/edit")
+        );
+        // Absolute URLs (not starting with `/`) are left untouched.
+        assert_eq!(v["avatar_url"], json!("https://cdn.example.com/x.png"));
     }
 
     #[test]
