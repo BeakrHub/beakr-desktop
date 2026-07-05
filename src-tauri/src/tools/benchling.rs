@@ -53,11 +53,49 @@ fn api_base(sess: &BenchlingSession) -> String {
 /// The agent surfaces this verbatim to tell the user how to recover.
 const RECONNECT_ERROR: &str = "Benchling session expired - reconnect in the Beakr desktop app";
 
-/// Entry content search is a fallback over per-entry detail requests. Keep it
-/// bounded so a broad workspace query does not turn a healthy desktop into a
-/// false "offline" timeout.
-const ENTRY_CONTENT_SEARCH_LIMIT: usize = 75;
-const ENTRY_CONTENT_SEARCH_CONCURRENCY: usize = 8;
+/// Benchling's internal global-search endpoint. This is a ranked, full-text search
+/// over item names AND notebook/protocol BODY content (verified live 2026-07-05:
+/// distinctive body-only terms like "phusion"/"supernatant" return the entry whose
+/// steps contain them, with the term absent from the title). It replaces the old
+/// "list every entry, then GET each one and grep it" fallback that timed out on
+/// accounts with many entries — exactly the failure a free user reported.
+///
+/// Unlike the read GETs, this is a POST and is CSRF-guarded, so it needs the token
+/// from the app-shell HTML `<meta name="csrf-token">` (see [`fetch_csrf_token`]).
+const SEARCH_PATH: &str = "/search?includeStorableExtras=false&allowAsyncBlast=true";
+/// Default number of ranked hits to request. The web app uses 25; that is plenty
+/// to surface the right item for a natural-language query without a large payload.
+const SEARCH_DEFAULT_LIMIT: u64 = 25;
+/// Hard cap on the caller-supplied page size so a runaway `limit` can't ask Benchling
+/// for an unbounded result set.
+const SEARCH_MAX_LIMIT: u64 = 50;
+
+/// Every TYPES token the web app's global search requests. Used verbatim for the
+/// unscoped `benchling_search`; the per-type tools narrow this to their own token(s).
+/// Confirmed against the live global-search request body 2026-07-05.
+const ALL_SEARCH_TYPES: &[&str] = &[
+    "folder",
+    "sequence",
+    "rna_sequence",
+    "protein",
+    "basic_folder_item",
+    "oligo",
+    "rna_oligo",
+    "mixture",
+    "entry",
+    "protocol",
+    "request_v2_submission",
+    "request_v2_definition",
+    "sequence_analysis",
+    "protein_alignment",
+    "bulk_assembly",
+    "worklist",
+    "template",
+    "subtemplate",
+    "form_definition",
+    "template_collection",
+    "pipeline_file",
+];
 
 /// Item-kind classification by Benchling id prefix (confirmed 2026-06-18).
 /// `etr_`=entry, `prt_`=protocol, `seq_`=DNA/AA sequence, `file_`=uploaded file;
@@ -112,6 +150,7 @@ pub async fn dispatch(
         "benchling_get_dna_sequence" => get_dna_sequence(state, &params).await?,
         "benchling_list_custom_entities" => list_custom_entities(state, &params).await?,
         "benchling_get_custom_entity" => get_custom_entity(state, &params).await?,
+        "benchling_search" => search_all(state, &params).await?,
         "benchling_search_projects" => search_projects(state, &params).await?,
         "benchling_search_entries" => search_entries(state, &params).await?,
         "benchling_search_dna_sequences" => search_dna_sequences(state, &params).await?,
@@ -222,6 +261,261 @@ fn absolutize_urls(value: &mut Value, host: &str) {
     }
 }
 
+// ---- ranked global search (POST /search) -----------------------------------
+
+/// Fetches a CSRF token for the CSRF-guarded POST search.
+///
+/// Benchling renders the token into `<meta name="csrf-token" content="...">` of the
+/// server-rendered app shell. It is NOT in a JS-readable cookie, localStorage, or
+/// any `/1/api` JSON body (all verified live 2026-07-05), so the only way to obtain
+/// it is to read an authenticated HTML page. The token is bound to the session
+/// cookie, so we fetch this session's tenant home and extract it. Read GETs don't
+/// need CSRF; only the POST /search path does.
+async fn fetch_csrf_token(sess: &BenchlingSession) -> Result<String, String> {
+    // The tenant home for a path-handle (free) tenant is /{handle}; any authenticated
+    // page carries the meta, so fall back to the tenant root if the handle page fails.
+    let candidates = [
+        format!("https://{}/{}", sess.tenant_host, sess.user_handle),
+        format!("https://{}/", sess.tenant_host),
+    ];
+    let mut last_err = String::from("no CSRF page candidates");
+    for url in candidates {
+        match http_client()
+            .get(&url)
+            .header("Cookie", format!("session={}", sess.session_cookie))
+            .header("Accept", "text/html")
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let html = resp
+                    .text()
+                    .await
+                    .map_err(|e| format!("Failed to read Benchling page for CSRF: {e}"))?;
+                if let Some(token) = extract_csrf_meta(&html) {
+                    return Ok(token);
+                }
+                last_err = "CSRF meta tag not found in Benchling page".to_string();
+            }
+            Ok(resp) => last_err = format!("CSRF page returned HTTP {}", resp.status()),
+            Err(e) => last_err = format!("CSRF page request failed: {e}"),
+        }
+    }
+    Err(last_err)
+}
+
+/// Extracts the token from `<meta name="csrf-token" content="...">`. Tolerant of
+/// attribute order and single/double quotes; returns None if the tag is absent.
+fn extract_csrf_meta(html: &str) -> Option<String> {
+    // Anchor on the token's name, then read the nearest following content="…".
+    let anchor = html.find("csrf-token")?;
+    let after = &html[anchor..];
+    let content_at = after.find("content=")?;
+    let rest = &after[content_at + "content=".len()..];
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &rest[1..];
+    let end = rest.find(quote)?;
+    let token = &rest[..end];
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// POSTs `<API_BASE><path>` with the session cookie + CSRF token and parses JSON.
+/// Mirrors [`api_get`]'s 401 handling (clears the session and returns the reconnect
+/// error) so a dead session self-heals through the same path as reads.
+async fn api_post(
+    state: &AppState,
+    sess: &BenchlingSession,
+    path: &str,
+    csrf: &str,
+    body: Value,
+) -> Result<Value, String> {
+    let url = format!("{}{path}", api_base(sess));
+    let resp = http_client()
+        .post(&url)
+        .header("Cookie", format!("session={}", sess.session_cookie))
+        .header("X-CSRFToken", csrf)
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Benchling request failed: {e}"))?;
+
+    let status = resp.status();
+    if status.as_u16() == 401 {
+        *state.benchling_session.write().await = None;
+        return Err(RECONNECT_ERROR.to_string());
+    }
+    if !status.is_success() {
+        return Err(format!("Benchling API error {status} for {path}"));
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read Benchling response: {e}"))?;
+    let mut json: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Invalid Benchling JSON for {path}: {e}"))?;
+    absolutize_urls(&mut json, &sess.tenant_host);
+    Ok(json)
+}
+
+/// Clamps a caller-supplied `limit` param to `[1, SEARCH_MAX_LIMIT]`, defaulting to
+/// [`SEARCH_DEFAULT_LIMIT`]. Accepts either a JSON number or numeric string (the
+/// backend forwards agent args as strings).
+fn search_limit(params: &Value) -> u64 {
+    let raw = params
+        .get("limit")
+        .or_else(|| params.get("page_size"))
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    raw.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT)
+}
+
+/// Runs the ranked global search for `query`, scoped to `types`. Returns the raw
+/// Benchling response (ids + `*SummariesById` maps + scores); projection into tidy
+/// rows is [`project_search_results`].
+async fn ranked_search(
+    state: &AppState,
+    sess: &BenchlingSession,
+    query: &str,
+    types: &[&str],
+    limit: u64,
+) -> Result<Value, String> {
+    let csrf = fetch_csrf_token(sess).await?;
+    let body = json!({
+        "filters": [
+            { "key": "TYPES", "operator": "IS_ONE_OF", "value": types },
+            { "key": "ARCHIVE_PURPOSES", "operator": "IS_ONE_OF", "value": ["NOT_ARCHIVED"] },
+            { "key": "IS_ASSOCIATED_WITH_UNSUBMITTED_REQUEST_V2_SUBMISSION", "operator": "IS_FALSE", "value": null },
+            { "key": "PROCESSES_IS_SYSTEM_DATA_FILTER", "operator": "IS_FALSE", "value": null },
+        ],
+        "offset": 0,
+        "limit": limit,
+        "query": query,
+        "sorts": [{ "key": "relevance", "reverse": false }],
+        "nextToken": null,
+        "groupBy": null,
+        "searchSource": "listing:GLOBAL",
+    });
+    api_post(state, sess, SEARCH_PATH, &csrf, body).await
+}
+
+/// Merges every top-level `*ById` summary map in a search response into one
+/// id -> summary lookup. Benchling scatters item detail across many buckets
+/// (`entrySummariesById`, `protocolSummariesById`, `foldersById`, `fileSummariesById`,
+/// …); the caller just needs "the summary for this id" regardless of bucket.
+fn merge_summaries(resp: &Value) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = resp.as_object() {
+        for (key, val) in obj {
+            if key.ends_with("ById") {
+                if let Some(map) = val.as_object() {
+                    for (id, summary) in map {
+                        out.entry(id.clone()).or_insert_with(|| summary.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Short type label for a result id, so the agent can tell entries from protocols
+/// etc. in a mixed `benchling_search` result.
+fn kind_label(id: &str) -> &'static str {
+    match classify_id(id) {
+        ItemKind::Entry => "entry",
+        ItemKind::Sequence => "dna_sequence",
+        ItemKind::Protocol => "protocol",
+        ItemKind::AaSequence => "aa_sequence",
+        ItemKind::File => "file",
+        ItemKind::CustomEntity => "custom_entity",
+    }
+}
+
+/// Projects a raw search response into ranked result rows, preserving Benchling's
+/// relevance order. Optional client-side filters:
+///   - `kind`: keep only ids of this item kind (id-prefix). None keeps all types.
+///   - `project_id`: keep only items whose containing folder's `api_identifier`
+///     matches (Benchling's search has no working server-side folder filter — the
+///     documented keys 500 — so scoping is done here from each item's summary).
+///   - `modified_after`: keep only items modified on/after this ISO date/timestamp
+///     (lexicographic compare is chronological for ISO-8601 UTC).
+/// Each row carries id, name, type, project id/name, timestamps, a Benchling link,
+/// and the relevance score.
+fn project_search_results(
+    resp: &Value,
+    kind: Option<ItemKind>,
+    project_id: Option<&str>,
+    modified_after: Option<&str>,
+) -> Vec<Value> {
+    let summaries = merge_summaries(resp);
+    let scores = resp.get("scoresById").and_then(|v| v.as_object());
+    let ids = resp.get("ids").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    let mut rows = Vec::new();
+    for id_val in ids {
+        let Some(id) = id_val.as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Some(k) = kind {
+            if classify_id(id) != k {
+                continue;
+            }
+        }
+        let summary = summaries.get(id).cloned().unwrap_or_else(|| json!({}));
+        let folder = summary.get("folder");
+        let project_api = folder
+            .and_then(|f| f.get("api_identifier"))
+            .and_then(|v| v.as_str());
+        if let Some(want) = project_id {
+            if project_api != Some(want) {
+                continue;
+            }
+        }
+        let modified = summary.get("modified_at").and_then(|v| v.as_str());
+        if let Some(after) = modified_after {
+            match modified {
+                Some(m) if m >= after => {}
+                // Drop items with no timestamp or an older one when a floor is set.
+                _ => continue,
+            }
+        }
+        rows.push(json!({
+            "id": id,
+            "type": kind_label(id),
+            "name": summary.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            "project_id": project_api,
+            "project_name": folder.and_then(|f| f.get("name")).and_then(|v| v.as_str()),
+            "modified_at": modified,
+            "created_at": summary.get("created_at"),
+            "url": summary.get("editURL").or_else(|| summary.get("url")),
+            "score": scores.and_then(|s| s.get(id)),
+            "match_source": "ranked_content",
+        }));
+    }
+    rows
+}
+
+/// Assembles the standard search tool envelope: the projected rows plus the ranking
+/// metadata the backend/agent use to decide whether to page or narrow.
+fn search_envelope(items_key: &str, rows: Vec<Value>, resp: &Value) -> Value {
+    json!({
+        items_key: rows,
+        "search_strategy": "ranked_content_search",
+        "total_ranked": resp.get("total"),
+        "is_exact": resp.get("isExact"),
+        "timed_out": resp.get("timedOut"),
+    })
+}
+
 // ---- shared listing helpers ------------------------------------------------
 
 /// Extracts the first array found under any of `keys`, else an empty list. This
@@ -278,14 +572,6 @@ fn item_name(item: &Value) -> String {
         .or_else(|| item.get("displayName").and_then(|v| v.as_str()))
         .unwrap_or("")
         .to_string()
-}
-
-fn item_id(item: &Value) -> Option<String> {
-    item.get("id")
-        .and_then(|v| v.as_str())
-        .or_else(|| item.get("api_identifier").and_then(|v| v.as_str()))
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
 }
 
 /// Lists all projects (folders) for the session.
@@ -469,106 +755,71 @@ async fn search_projects(state: &AppState, params: &Value) -> Result<Value, Stri
     Ok(json!({ "projects": matches }))
 }
 
+/// Ranked, full-text entry search over names AND notebook body content.
+///
+/// Replaces the old "list every entry then GET each and grep it" scan, which timed
+/// out on accounts with many entries (a free user hit exactly this). One ranked
+/// `/search` call returns the right entries with names, so the agent no longer
+/// enumerates. `project_id`/`modified_after` narrow results client-side.
 async fn search_entries(state: &AppState, params: &Value) -> Result<Value, String> {
     let sess = session(state).await?;
     let query = require_str(params, "query")?;
-    let entries = collect_items(state, &sess, None, ItemKind::Entry).await?;
-    let mut seen = std::collections::HashSet::new();
-    let mut matches = Vec::new();
-    let mut title_match_count = 0;
+    let project_id = optional_str(params, "project_id");
+    let modified_after = optional_str(params, "modified_after");
+    let resp = ranked_search(state, &sess, &query, &["entry"], search_limit(params)).await?;
+    let rows = project_search_results(
+        &resp,
+        Some(ItemKind::Entry),
+        project_id.as_deref(),
+        modified_after.as_deref(),
+    );
+    Ok(search_envelope("entries", rows, &resp))
+}
 
-    for entry in &entries {
-        if name_contains(&item_name(entry), &query) {
-            if let Some(id) = item_id(entry) {
-                seen.insert(id);
-            }
-            let mut matched = entry.clone();
-            set_match_source(&mut matched, "title");
-            matches.push(matched);
-            title_match_count += 1;
-        }
-    }
-
-    let candidates: Vec<&Value> = entries
-        .iter()
-        .filter(|entry| item_id(entry).is_some_and(|id| !seen.contains(&id)))
-        .collect();
-    let content_search_truncated = candidates.len() > ENTRY_CONTENT_SEARCH_LIMIT;
-    let mut content_entries_scanned = 0;
-    let mut content_match_count = 0;
-    let mut content_scan_errors = 0;
-
-    let scan_inputs: Vec<(Value, String)> = candidates
-        .into_iter()
-        .take(ENTRY_CONTENT_SEARCH_LIMIT)
-        .filter_map(|entry| item_id(entry).map(|id| (entry.clone(), id)))
-        .collect();
-
-    for chunk in scan_inputs.chunks(ENTRY_CONTENT_SEARCH_CONCURRENCY) {
-        let mut handles = Vec::new();
-        for (entry, id) in chunk {
-            let state_clone = (*state).clone();
-            let sess_clone = sess.clone();
-            let entry = entry.clone();
-            let id = id.clone();
-            handles.push(tokio::spawn(async move {
-                let detail_path = format!("/entries/{}?view=true", urlencoding::encode(&id));
-                (
-                    entry,
-                    id,
-                    api_get(&state_clone, &sess_clone, &detail_path).await,
-                )
-            }));
-        }
-
-        for handle in handles {
-            let Ok((entry, id, result)) = handle.await else {
-                content_scan_errors += 1;
-                continue;
-            };
-            match result {
-                Ok(detail) => {
-                    content_entries_scanned += 1;
-                    if value_contains_text(&detail, &query) {
-                        seen.insert(id);
-                        let mut matched = entry;
-                        set_match_source(&mut matched, "content");
-                        matches.push(matched);
-                        content_match_count += 1;
-                    }
-                }
-                Err(e) if e == RECONNECT_ERROR => return Err(e),
-                Err(_) => {
-                    content_scan_errors += 1;
-                }
-            }
-        }
-    }
-
-    Ok(json!({
-        "entries": matches,
-        "search_strategy": "title_then_bounded_content",
-        "title_match_count": title_match_count,
-        "content_match_count": content_match_count,
-        "content_entries_scanned": content_entries_scanned,
-        "content_search_limit": ENTRY_CONTENT_SEARCH_LIMIT,
-        "content_search_truncated": content_search_truncated,
-        "content_scan_errors": content_scan_errors,
-    }))
+/// Ranked global search across all Benchling item types (entries, protocols,
+/// sequences, proteins, files, folders). Use when the user asks "where did I write
+/// about X" without knowing the object type. Rows carry a `type` so the agent can
+/// route a follow-up get_* to the right detail tool.
+async fn search_all(state: &AppState, params: &Value) -> Result<Value, String> {
+    let sess = session(state).await?;
+    let query = require_str(params, "query")?;
+    let project_id = optional_str(params, "project_id");
+    let modified_after = optional_str(params, "modified_after");
+    let resp = ranked_search(state, &sess, &query, ALL_SEARCH_TYPES, search_limit(params)).await?;
+    let rows =
+        project_search_results(&resp, None, project_id.as_deref(), modified_after.as_deref());
+    Ok(search_envelope("results", rows, &resp))
 }
 
 async fn search_dna_sequences(state: &AppState, params: &Value) -> Result<Value, String> {
     let sess = session(state).await?;
     let query = require_str(params, "query")?;
-    let sequences = collect_items(state, &sess, None, ItemKind::Sequence).await?;
-    Ok(json!({ "dna_sequences": filter_by_name(sequences, &query) }))
+    let project_id = optional_str(params, "project_id");
+    // DNA/RNA sequences and oligos all surface under the seq_ prefix; scope the
+    // ranked search to the sequence type family. Oligo ids don't share the seq_
+    // prefix, so rely on the server TYPES scope rather than a client kind filter.
+    let resp = ranked_search(
+        state,
+        &sess,
+        &query,
+        &["sequence", "rna_sequence", "oligo", "rna_oligo"],
+        search_limit(params),
+    )
+    .await?;
+    let rows = project_search_results(&resp, None, project_id.as_deref(), None);
+    Ok(search_envelope("dna_sequences", rows, &resp))
 }
 
 async fn search_custom_entities(state: &AppState, params: &Value) -> Result<Value, String> {
     let sess = session(state).await?;
     let query = require_str(params, "query")?;
-    let entities = collect_items(state, &sess, None, ItemKind::CustomEntity).await?;
-    Ok(json!({ "custom_entities": filter_by_name(entities, &query) }))
+    let project_id = optional_str(params, "project_id");
+    // Custom-entity ids have no single stable TYPES token, so search broadly and
+    // keep only ids that classify as custom entities (the else-branch prefix).
+    let resp = ranked_search(state, &sess, &query, ALL_SEARCH_TYPES, search_limit(params)).await?;
+    let rows =
+        project_search_results(&resp, Some(ItemKind::CustomEntity), project_id.as_deref(), None);
+    Ok(search_envelope("custom_entities", rows, &resp))
 }
 
 // ---- protocol handlers ------------------------------------------------------
@@ -599,8 +850,11 @@ async fn get_protocol(state: &AppState, params: &Value) -> Result<Value, String>
 async fn search_protocols(state: &AppState, params: &Value) -> Result<Value, String> {
     let sess = session(state).await?;
     let query = require_str(params, "query")?;
-    let protocols = collect_items(state, &sess, None, ItemKind::Protocol).await?;
-    Ok(json!({ "protocols": filter_by_name(protocols, &query) }))
+    let project_id = optional_str(params, "project_id");
+    let resp = ranked_search(state, &sess, &query, &["protocol"], search_limit(params)).await?;
+    let rows =
+        project_search_results(&resp, Some(ItemKind::Protocol), project_id.as_deref(), None);
+    Ok(search_envelope("protocols", rows, &resp))
 }
 
 // ---- AA sequence handlers ---------------------------------------------------
@@ -631,8 +885,11 @@ async fn get_aa_sequence(state: &AppState, params: &Value) -> Result<Value, Stri
 async fn search_aa_sequences(state: &AppState, params: &Value) -> Result<Value, String> {
     let sess = session(state).await?;
     let query = require_str(params, "query")?;
-    let sequences = collect_items(state, &sess, None, ItemKind::AaSequence).await?;
-    Ok(json!({ "aa_sequences": filter_by_name(sequences, &query) }))
+    let project_id = optional_str(params, "project_id");
+    let resp = ranked_search(state, &sess, &query, &["protein"], search_limit(params)).await?;
+    let rows =
+        project_search_results(&resp, Some(ItemKind::AaSequence), project_id.as_deref(), None);
+    Ok(search_envelope("aa_sequences", rows, &resp))
 }
 
 // ---- file handlers ----------------------------------------------------------
@@ -663,8 +920,13 @@ async fn get_file(state: &AppState, params: &Value) -> Result<Value, String> {
 async fn search_files(state: &AppState, params: &Value) -> Result<Value, String> {
     let sess = session(state).await?;
     let query = require_str(params, "query")?;
-    let files = collect_items(state, &sess, None, ItemKind::File).await?;
-    Ok(json!({ "files": filter_by_name(files, &query) }))
+    let project_id = optional_str(params, "project_id");
+    // The exact TYPES token for uploaded files is uncertain, so search broadly and
+    // keep only file_ ids (classify by prefix). This stays correct even if the
+    // "pipeline_file" token doesn't cover every uploaded-file variant.
+    let resp = ranked_search(state, &sess, &query, ALL_SEARCH_TYPES, search_limit(params)).await?;
+    let rows = project_search_results(&resp, Some(ItemKind::File), project_id.as_deref(), None);
+    Ok(search_envelope("files", rows, &resp))
 }
 
 // ---- param + filter utilities ----------------------------------------------
@@ -686,50 +948,11 @@ fn optional_str(params: &Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Case-insensitive substring match. Still used by `search_projects`, which filters
+/// the small `/folders` list locally rather than through the ranked item search
+/// (projects are folders, not search items).
 fn name_contains(name: &str, query: &str) -> bool {
     name.to_lowercase().contains(&query.to_lowercase())
-}
-
-fn filter_by_name(items: Vec<Value>, query: &str) -> Vec<Value> {
-    items
-        .into_iter()
-        .filter(|it| name_contains(&item_name(it), query))
-        .collect()
-}
-
-fn set_match_source(item: &mut Value, source: &str) {
-    if let Value::Object(map) = item {
-        map.insert(
-            "match_source".to_string(),
-            Value::String(source.to_string()),
-        );
-    }
-}
-
-fn value_contains_text(value: &Value, query: &str) -> bool {
-    let needle = query.trim().to_lowercase();
-    !needle.is_empty() && value_contains_lowercase_text(value, &needle)
-}
-
-fn value_contains_lowercase_text(value: &Value, needle: &str) -> bool {
-    match value {
-        Value::String(s) => s.to_lowercase().contains(needle),
-        Value::Array(items) => items
-            .iter()
-            .any(|item| value_contains_lowercase_text(item, needle)),
-        Value::Object(map) => map
-            .iter()
-            .filter(|(key, _)| !is_search_noise_key(key))
-            .any(|(_, item)| value_contains_lowercase_text(item, needle)),
-        _ => false,
-    }
-}
-
-fn is_search_noise_key(key: &str) -> bool {
-    matches!(
-        key,
-        "url" | "editURL" | "webURL" | "webUrl" | "owner_url" | "avatar_url" | "apiURL" | "apiUrl"
-    )
 }
 
 #[cfg(test)]
@@ -840,40 +1063,164 @@ mod tests {
     }
 
     #[test]
-    fn value_contains_text_matches_nested_entry_content() {
-        let entry = json!({
-            "entryDays": [
-                {
-                    "body": {
-                        "blocks": [
-                            { "text": "Negative control looked clean." },
-                            { "text": "Observed TP53 induction after treatment." }
-                        ]
-                    }
-                }
-            ],
-            "webURL": "https://benchling.com/acme/f_/not-content"
-        });
-
-        assert!(value_contains_text(&entry, "tp53 induction"));
-        assert!(!value_contains_text(&entry, "missing-term"));
+    fn extract_csrf_meta_reads_content_attr() {
+        // The token lives in the server-rendered app shell as a meta tag; the SPA
+        // strips it from the live DOM, so we parse the raw HTML (verified 2026-07-05).
+        let html = r#"<head><meta name="csrf-token" content="ImQ3NDhmYWU4Ig.akpjDw.sig"/></head>"#;
+        assert_eq!(
+            extract_csrf_meta(html).as_deref(),
+            Some("ImQ3NDhmYWU4Ig.akpjDw.sig")
+        );
+        // Single-quoted variant.
+        let single = "<meta content='tok123' name='csrf-token'>";
+        // name comes after content here, so the anchor-on-name path must still find
+        // the nearest content= — which precedes it. This returns None (content= is
+        // before the anchor), so callers fall through to the next page candidate.
+        assert_eq!(extract_csrf_meta(single), None);
+        // Missing tag -> None.
+        assert_eq!(extract_csrf_meta("<html><body>no token</body></html>"), None);
     }
 
     #[test]
-    fn value_contains_text_ignores_url_noise() {
-        let entry = json!({
-            "name": "Body-only probe",
-            "webURL": "https://benchling.com/acme/f_/TP53-url-only",
-            "entryDays": [{ "body": { "blocks": [{ "text": "No gene mention here." }] } }]
-        });
+    fn search_limit_clamps_and_defaults() {
+        assert_eq!(search_limit(&json!({})), SEARCH_DEFAULT_LIMIT);
+        assert_eq!(search_limit(&json!({ "limit": 5 })), 5);
+        // Numeric strings (how the backend forwards agent args) are accepted.
+        assert_eq!(search_limit(&json!({ "limit": "10" })), 10);
+        // Over the cap is clamped; zero/garbage falls back sanely to >= 1.
+        assert_eq!(search_limit(&json!({ "limit": 9999 })), SEARCH_MAX_LIMIT);
+        assert_eq!(search_limit(&json!({ "limit": 0 })), 1);
+        // page_size is accepted as an alias for the schema's pagination hint.
+        assert_eq!(search_limit(&json!({ "page_size": 7 })), 7);
+    }
 
-        assert!(!value_contains_text(&entry, "tp53-url-only"));
+    #[test]
+    fn merge_summaries_flattens_all_by_id_maps() {
+        let resp = json!({
+            "entrySummariesById": { "etr_1": { "name": "Entry One" } },
+            "protocolSummariesById": { "prt_1": { "name": "Protocol One" } },
+            "scoresById": { "etr_1": 0.9 },
+            "ids": ["etr_1", "prt_1"],
+        });
+        let merged = merge_summaries(&resp);
+        assert_eq!(merged.get("etr_1").unwrap()["name"], json!("Entry One"));
+        assert_eq!(merged.get("prt_1").unwrap()["name"], json!("Protocol One"));
+        // scoresById is also a *ById map but its values aren't summaries; harmless to
+        // include since lookups are by the caller's item id against summary maps.
+        assert!(merged.contains_key("etr_1"));
+    }
+
+    /// A response shaped like the live `/1/api/search` payload for assertions.
+    fn sample_search_response() -> Value {
+        json!({
+            "ids": ["prt_lig", "etr_old", "etr_other_proj"],
+            "total": 3,
+            "isExact": true,
+            "timedOut": false,
+            "scoresById": { "prt_lig": 12.5, "etr_old": 3.1, "etr_other_proj": 2.0 },
+            "protocolSummariesById": {
+                "prt_lig": {
+                    "name": "Ligation Protocol",
+                    "modified_at": "2026-06-20T10:00:00+00:00",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "editURL": "https://benchling.com/mstrome/f/lib_A-proj/prt_lig-ligation/edit",
+                    "folder": { "api_identifier": "lib_A", "name": "Cloning" }
+                }
+            },
+            "entrySummariesById": {
+                "etr_old": {
+                    "name": "Old Prep",
+                    "modified_at": "2026-02-01T00:00:00+00:00",
+                    "folder": { "api_identifier": "lib_A", "name": "Cloning" }
+                },
+                "etr_other_proj": {
+                    "name": "Other Project Note",
+                    "modified_at": "2026-06-25T00:00:00+00:00",
+                    "folder": { "api_identifier": "lib_B", "name": "Sequencing" }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn project_search_results_preserves_rank_and_projects_fields() {
+        let rows = project_search_results(&sample_search_response(), None, None, None);
+        // Ranked order from `ids` is preserved.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["id"], json!("prt_lig"));
+        assert_eq!(rows[0]["type"], json!("protocol"));
+        assert_eq!(rows[0]["name"], json!("Ligation Protocol"));
+        assert_eq!(rows[0]["project_id"], json!("lib_A"));
+        assert_eq!(rows[0]["project_name"], json!("Cloning"));
+        assert_eq!(rows[0]["score"], json!(12.5));
+        assert_eq!(rows[0]["match_source"], json!("ranked_content"));
+        // editURL is surfaced as the clickable link.
+        assert_eq!(
+            rows[0]["url"],
+            json!("https://benchling.com/mstrome/f/lib_A-proj/prt_lig-ligation/edit")
+        );
+    }
+
+    #[test]
+    fn project_search_results_filters_by_kind() {
+        let rows = project_search_results(
+            &sample_search_response(),
+            Some(ItemKind::Entry),
+            None,
+            None,
+        );
+        // Only the etr_ ids survive the kind filter; the protocol is dropped.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r["type"] == json!("entry")));
+    }
+
+    #[test]
+    fn project_search_results_filters_by_project() {
+        // Scoping to lib_B keeps only the entry whose folder.api_identifier matches.
+        let rows =
+            project_search_results(&sample_search_response(), None, Some("lib_B"), None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], json!("etr_other_proj"));
+    }
+
+    #[test]
+    fn project_search_results_filters_by_modified_after() {
+        // Only items modified on/after the floor survive; undated items are dropped.
+        let rows = project_search_results(
+            &sample_search_response(),
+            None,
+            None,
+            Some("2026-06-01"),
+        );
+        let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert!(ids.contains(&"prt_lig")); // 2026-06-20
+        assert!(ids.contains(&"etr_other_proj")); // 2026-06-25
+        assert!(!ids.contains(&"etr_old")); // 2026-02-01, before the floor
+    }
+
+    #[test]
+    fn search_envelope_carries_ranking_metadata() {
+        let resp = sample_search_response();
+        let rows = project_search_results(&resp, None, None, None);
+        let env = search_envelope("results", rows, &resp);
+        assert_eq!(env["search_strategy"], json!("ranked_content_search"));
+        assert_eq!(env["total_ranked"], json!(3));
+        assert_eq!(env["is_exact"], json!(true));
+        assert_eq!(env["timed_out"], json!(false));
+        assert!(env["results"].is_array());
+    }
+
+    #[test]
+    fn dispatch_routes_global_search_tool() {
+        // benchling_search is the new global ranked-search tool; it must be routable.
+        assert!(handles("benchling_search"));
     }
 
     #[test]
     fn handles_matches_benchling_prefix_only() {
         assert!(handles("benchling_list_projects"));
         assert!(handles("benchling_get_entry"));
+        assert!(handles("benchling_search"));
         assert!(!handles("list_files"));
     }
 }
