@@ -326,6 +326,33 @@ fn extract_csrf_meta(html: &str) -> Option<String> {
     }
 }
 
+/// Builds the header set for a CSRF-guarded Benchling POST.
+///
+/// Benchling's CSRF guard (Flask-WTF) does a strict referrer check on HTTPS POSTs:
+/// it rejects the request outright when the `Referer` header is absent ("The referrer
+/// header is missing.") and requires that header to share the request's scheme+host.
+/// A browser attaches `Referer` automatically, but reqwest does not, so every
+/// `/search` POST failed with a CSRF 400 until we send it explicitly. The value only
+/// needs to match the request origin, so the tenant root suffices. Confirmed live
+/// 2026-07-07: the identical POST is a CSRF 400 without `Referer` and 200 with it.
+fn csrf_post_headers(sess: &BenchlingSession, csrf: &str) -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    let mut set = |name: &'static str, value: String| {
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            headers.insert(name, v);
+        }
+    };
+    set("Cookie", format!("session={}", sess.session_cookie));
+    set("X-CSRFToken", csrf.to_string());
+    set("X-Requested-With", "XMLHttpRequest".to_string());
+    set("Referer", format!("https://{}/", sess.tenant_host));
+    set("Accept", "application/json".to_string());
+    set("Content-Type", "application/json".to_string());
+    headers
+}
+
 /// POSTs `<API_BASE><path>` with the session cookie + CSRF token and parses JSON.
 /// Mirrors [`api_get`]'s 401 handling (clears the session and returns the reconnect
 /// error) so a dead session self-heals through the same path as reads.
@@ -339,11 +366,7 @@ async fn api_post(
     let url = format!("{}{path}", api_base(sess));
     let resp = http_client()
         .post(&url)
-        .header("Cookie", format!("session={}", sess.session_cookie))
-        .header("X-CSRFToken", csrf)
-        .header("X-Requested-With", "XMLHttpRequest")
-        .header("Accept", "application/json")
-        .header("Content-Type", "application/json")
+        .headers(csrf_post_headers(sess, csrf))
         .json(&body)
         .send()
         .await
@@ -958,6 +981,33 @@ fn name_contains(name: &str, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csrf_post_sends_referer_matching_tenant_origin() {
+        // Root cause of the "search returns 400" bug: Benchling's Flask-WTF CSRF
+        // guard rejects HTTPS POSTs with no Referer ("The referrer header is
+        // missing."), and requires it to share the request origin. reqwest does not
+        // set Referer automatically the way a browser does, so this header must be
+        // present and point at the tenant. Without it every /search POST is a CSRF
+        // 400 while GET reads (not CSRF-checked) keep working.
+        let sess = BenchlingSession {
+            session_cookie: "cookievalue".to_string(),
+            tenant_host: "benchling.com".to_string(),
+            user_handle: "mstrome".to_string(),
+        };
+        let headers = csrf_post_headers(&sess, "tok123");
+
+        let referer = headers
+            .get("Referer")
+            .expect("CSRF POST must send a Referer header or Benchling returns a 400");
+        assert_eq!(referer, "https://benchling.com/");
+
+        // The token and session must still ride along, and the request must be
+        // flagged as an XHR (Benchling only serves the JSON search that way).
+        assert_eq!(headers.get("X-CSRFToken").unwrap(), "tok123");
+        assert_eq!(headers.get("Cookie").unwrap(), "session=cookievalue");
+        assert_eq!(headers.get("X-Requested-With").unwrap(), "XMLHttpRequest");
+    }
 
     #[test]
     fn classify_id_maps_prefixes() {
