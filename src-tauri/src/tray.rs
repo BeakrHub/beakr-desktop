@@ -66,6 +66,10 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 /// Create or focus the settings webview window.
 pub fn show_settings_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
+        // unminimize first: show() doesn't deminiaturize a Dock-minimized
+        // window and set_focus() is a no-op while minimized (tao),
+        // so without this a Dock/tray click appears to do nothing.
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
         return;

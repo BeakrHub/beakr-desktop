@@ -59,9 +59,10 @@ impl WsClient {
                         log::warn!("Device revoked by server");
                         self.set_status(ConnectionStatus::Revoked).await;
                         // Unlink authoritatively in Rust: a revoked device can be
-                        // revoked-at-startup (the app is a menu-bar accessory with
-                        // no webview yet), so we can't rely on the frontend's
-                        // token_invalid listener to clear the token + flip the tray.
+                        // revoked-at-startup (the app may have no webview yet —
+                        // the window opens on demand), so we can't rely on the
+                        // frontend's token_invalid listener to clear the token +
+                        // flip the tray.
                         if let Err(e) =
                             crate::commands::clear_device_token(&self.app, &self.state).await
                         {

@@ -97,9 +97,17 @@ pub fn run() {
             tray::setup_tray(app.handle())?;
             tray::update_tray_pairing(app.handle(), has_stored_token);
 
-            // In dev builds, auto-open the window on launch so testing does not
-            // depend on finding the tray icon. This app is an Accessory app (no
-            // Dock icon), and a full/notched menu bar can hide the tray icon.
+            // First run (no paired device): open the window on launch so a
+            // Finder/Spotlight launch lands on the pairing screen instead of a
+            // Dock icon with no window — macOS fires Reopen only on
+            // RE-activation, never on first launch. Paired launches stay
+            // silent so autostart at login doesn't pop a window.
+            if !has_stored_token {
+                tray::show_settings_window(app.handle());
+            }
+
+            // In dev builds, always auto-open the window on launch so testing
+            // doesn't depend on clicking the Dock or tray icon.
             #[cfg(debug_assertions)]
             tray::show_settings_window(app.handle());
 
@@ -187,14 +195,21 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
-            // macOS fires Reopen when the Dock icon is clicked while no window
-            // is visible (and on Finder/Spotlight re-launch of a running app).
+        .run(|_app_handle, _event| {
+            // macOS fires Reopen when the Dock icon is clicked (and on
+            // Finder/Spotlight re-launch of a running app). Only open the
+            // settings window when nothing is visible — a Dock click while
+            // e.g. the Benchling session window is up must not cover it.
+            // A minimized-only app reports has_visible_windows == false.
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
-                tray::show_settings_window(app_handle);
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = _event
+            {
+                if !has_visible_windows {
+                    tray::show_settings_window(_app_handle);
+                }
             }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (app_handle, event);
         });
 }
