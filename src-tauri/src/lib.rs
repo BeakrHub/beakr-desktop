@@ -52,11 +52,11 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(app_state.clone())
         .setup(move |app| {
-            // macOS: hide from Dock, show only in menu bar
-            #[cfg(target_os = "macos")]
-            {
-                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            }
+            // ENG-1377: keep the default Regular activation policy so the app has
+            // a Dock icon users can click to open it. Do not set
+            // ActivationPolicy::Accessory — tray-only proved too hidden (notched
+            // menu bars can swallow the tray icon). Dock click → RunEvent::Reopen
+            // (handled in run()) → settings window.
 
             // Load persisted settings
             let settings = config::load_settings(app.handle());
@@ -185,6 +185,16 @@ pub fn run() {
             session::commands::connect_session,
             session::commands::benchling_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // macOS fires Reopen when the Dock icon is clicked while no window
+            // is visible (and on Finder/Spotlight re-launch of a running app).
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                tray::show_settings_window(app_handle);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app_handle, event);
+        });
 }
