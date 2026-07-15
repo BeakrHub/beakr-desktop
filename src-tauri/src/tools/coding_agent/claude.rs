@@ -150,13 +150,19 @@ impl LocalCodingRunner for ClaudeRunner {
 
     fn classify_failure(&self, exit_code: Option<i32>, stderr_tail: &str) -> String {
         let lower = stderr_tail.to_lowercase();
-        if lower.contains("login expired")
+        if lower.contains("not logged in")
+            || lower.contains("login expired")
             || lower.contains("please run /login")
             || lower.contains("401")
             || lower.contains("invalid api key")
             || lower.contains("authentication")
         {
-            return format!("auth_failed: Claude Code auth failed — check the API key in Beakr Desktop settings. ({stderr_tail})");
+            // Subscription-first message (DESIGN.md decision 5): the common
+            // fix is logging into Claude Code, not adding an API key.
+            return format!(
+                "auth_failed: Claude Code isn't logged in on this Mac. Open Claude Code and \
+                 log in (or add an API key in Beakr Desktop settings). ({stderr_tail})"
+            );
         }
         if lower.contains("429") || lower.contains("rate limit") || lower.contains("overloaded") {
             return format!("quota_exceeded: Claude Code hit a rate/usage limit. ({stderr_tail})");
@@ -312,5 +318,37 @@ mod tests {
         assert!(r
             .classify_failure(Some(2), "something else broke")
             .starts_with("run_failed:"));
+    }
+
+    // Real output captured from `claude -p ... --output-format stream-json`
+    // on a machine with claude installed but NOT logged in (no subscription,
+    // no API key). Locks the not-logged-in path against a real fixture.
+    #[test]
+    fn real_not_logged_in_output_parses_and_classifies_as_auth() {
+        let init = r#"{"type":"system","subtype":"init","cwd":"/x","session_id":"1853c519-9b0b-4c79-bd97-697f476c516a","tools":["Bash","Edit"],"apiKeySource":"none","model":"claude-opus-4-8"}"#;
+        assert_eq!(
+            parse(init),
+            ParsedLine::Chunk(Chunk {
+                kind: "session",
+                text: None,
+                session_id: Some("1853c519-9b0b-4c79-bd97-697f476c516a".into()),
+            })
+        );
+
+        let result = r#"{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","session_id":"1853c519-9b0b-4c79-bd97-697f476c516a","total_cost_usd":0,"usage":{}}"#;
+        let final_result = match parse(result) {
+            ParsedLine::Final(r) => r,
+            other => panic!("expected Final, got {other:?}"),
+        };
+        assert!(final_result.is_error);
+        assert_eq!(
+            final_result.result.as_deref(),
+            Some("Not logged in · Please run /login")
+        );
+        // The orchestrator routes an is_error result's text through
+        // classify_failure; it must land as auth_failed, not run_failed.
+        assert!(ClaudeRunner
+            .classify_failure(Some(0), final_result.result.as_deref().unwrap())
+            .starts_with("auth_failed:"));
     }
 }

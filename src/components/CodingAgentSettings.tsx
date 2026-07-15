@@ -47,8 +47,9 @@ export default function CodingAgentSettings() {
         Coding Agent
       </h2>
       <p style={{ fontSize: "0.78rem", color: "#666", marginTop: 0, marginBottom: "0.75rem" }}>
-        Beakr can run Claude Code on this Mac when you ask it to. Runs use your
-        own Anthropic API key, stored only on this device.
+        Beakr can run Claude Code on this Mac when you ask it to. If you're
+        logged into Claude Code (any Claude subscription), it works as-is —
+        no setup needed. An API key is optional, only if you'd rather use one.
       </p>
       {editing ? (
         <div style={{ display: "flex", gap: "0.5rem" }}>
@@ -90,7 +91,7 @@ export default function CodingAgentSettings() {
           }}
         >
           <span style={{ fontSize: "0.9rem" }}>
-            {hasKey ? "Anthropic API key set ✓" : "No Anthropic API key"}
+            {hasKey ? "Anthropic API key set ✓" : "Using Claude Code login (no API key)"}
           </span>
           <button
             onClick={() => setEditing(true)}

@@ -82,14 +82,14 @@ pub async fn handle_streaming(
         .ok_or("coding_run_busy: a coding run is already in progress on this device")?;
 
     let settings = crate::config::load_settings(app);
+    // Auth is agnostic (DESIGN.md decision 5): most Beakr users have a Claude
+    // subscription, not an API key. We inject ANTHROPIC_API_KEY only if the
+    // user explicitly set one; otherwise the CLI uses whatever login already
+    // exists in ~/.claude / keychain from their own `claude` login. If neither
+    // is present, the run fails fast with "Not logged in" and we classify it
+    // as auth_failed with a "log into Claude Code" hint — no server-side
+    // pre-flight guess needed. Beakr never handles the subscription credential.
     let api_key = settings.anthropic_api_key.clone().filter(|k| !k.is_empty());
-    if runner.name() == "claude" && api_key.is_none() {
-        return Err(
-            "api_key_missing: add your Anthropic API key in Beakr Desktop settings to run \
-             Claude Code from Beakr (v1 uses your own key — see ENG-1286)"
-                .into(),
-        );
-    }
 
     let binary = binary::resolve(runner.name(), settings.claude_binary_path.as_deref())?;
 
