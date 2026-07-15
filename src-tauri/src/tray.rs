@@ -12,6 +12,10 @@ const WINDOW_TITLE: &str = "Beakr Desktop";
 /// Holds the tray menu items whose text we update at runtime.
 pub struct TrayState {
     pub status_item: MenuItem<tauri::Wry>,
+    /// "Stop coding run" — enabled only while a local coding run is active
+    /// (ENG-1528). Clicking cancels the active run via the inflight registry,
+    /// which SIGINTs the CLI's process group.
+    pub stop_run_item: MenuItem<tauri::Wry>,
     /// Opens the app/pairing window. Its label is state-aware: "Pair device"
     /// when no device is paired (it lands on the pairing screen) and "Open Beakr"
     /// once paired (the window is the device's status/folders/activity view, not
@@ -29,9 +33,14 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // startup, and claim_pairing_code/clear_token update it as pairing changes.
     let settings_item = MenuItemBuilder::with_id("settings", "Pair device").build(app)?;
 
+    let stop_run_item = MenuItemBuilder::with_id("stop_run", "Stop coding run")
+        .enabled(false)
+        .build(app)?;
+
     // Store the menu item handles so we can update them at runtime.
     app.manage(TrayState {
         status_item: status_item.clone(),
+        stop_run_item: stop_run_item.clone(),
         settings_item: settings_item.clone(),
     });
 
@@ -41,6 +50,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .item(&status_item)
         .separator()
         .item(&settings_item)
+        .item(&stop_run_item)
         .separator()
         .item(&quit_item)
         .build()?;
@@ -52,6 +62,22 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "settings" => {
                 show_settings_window(app);
+            }
+            "stop_run" => {
+                if let Some(state) = app.try_state::<crate::state::AppState>() {
+                    let active = state
+                        .active_coding_run
+                        .read()
+                        .expect("active run lock poisoned")
+                        .clone();
+                    match active {
+                        Some(request_id) => {
+                            log::info!("Tray stop: cancelling coding run {request_id}");
+                            state.inflight.cancel(&request_id);
+                        }
+                        None => log::debug!("Tray stop clicked with no active run"),
+                    }
+                }
             }
             "quit" => {
                 // Reap any live coding-run process groups before exiting so
@@ -126,5 +152,12 @@ pub fn update_tray_pairing(app: &AppHandle, is_paired: bool) {
     };
     if let Some(tray_state) = app.try_state::<TrayState>() {
         let _ = tray_state.settings_item.set_text(label);
+    }
+}
+
+/// Enable/disable the "Stop coding run" item as runs start/finish (ENG-1528).
+pub fn update_tray_coding_run(app: &AppHandle, active: bool) {
+    if let Some(tray_state) = app.try_state::<TrayState>() {
+        let _ = tray_state.stop_run_item.set_enabled(active);
     }
 }

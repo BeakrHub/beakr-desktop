@@ -82,6 +82,9 @@ pub struct AppState {
     pub inflight: Arc<crate::ws::inflight::InflightRegistry>,
     /// Live child process groups, reaped on quit (ENG-1527).
     pub processes: Arc<crate::process_group::ProcessRegistry>,
+    /// request_id of the coding run in progress, if any (ENG-1528). std
+    /// RwLock on purpose: the tray "Stop run" handler is synchronous.
+    pub active_coding_run: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl AppState {
@@ -105,6 +108,7 @@ impl AppState {
             benchling_session: Arc::new(RwLock::new(None)),
             inflight: Arc::new(crate::ws::inflight::InflightRegistry::new()),
             processes: Arc::new(crate::process_group::ProcessRegistry::new()),
+            active_coding_run: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
