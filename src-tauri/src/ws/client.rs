@@ -209,6 +209,7 @@ impl WsClient {
             platform_version: Some(os_version()),
             app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             coding_agents,
+            coding_agent_default: settings.default_cli.clone(),
         };
 
         let register_json = serde_json::to_string(&register)?;
@@ -278,6 +279,17 @@ impl WsClient {
         // their frames here; only this loop touches the socket.
         let (out_tx, mut out_rx) =
             tokio::sync::mpsc::channel::<OutgoingMessage>(OUTBOUND_BUFFER);
+
+        // Expose the outbound queue so settings changes can push a
+        // readiness_update mid-connection (ENG-1536). Cleared on every exit
+        // path below via the guard — a stale sender would silently drop
+        // pushes into a dead channel.
+        *self
+            .state
+            .ws_outbound
+            .write()
+            .expect("ws_outbound lock poisoned") = Some(out_tx.clone());
+        let _outbound_guard = OutboundGuard(self.state.ws_outbound.clone());
 
         // Time of the last inbound frame of ANY kind. A live link refreshes this
         // on every Ping->Pong round-trip; a half-open socket lets it go stale,
@@ -638,5 +650,19 @@ mod tests {
         // register()) before `is_online` goes stale and strands the Ask "+".
         assert!(PING_INTERVAL < LIVENESS_TIMEOUT);
         assert!(LIVENESS_TIMEOUT < Duration::from_secs(60));
+    }
+}
+
+/// Clears `AppState::ws_outbound` when the connection loop exits by any path
+/// (error, close, shutdown), so no one pushes into a dead channel.
+struct OutboundGuard(
+    std::sync::Arc<
+        std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OutgoingMessage>>>,
+    >,
+);
+
+impl Drop for OutboundGuard {
+    fn drop(&mut self) {
+        *self.0.write().expect("ws_outbound lock poisoned") = None;
     }
 }
