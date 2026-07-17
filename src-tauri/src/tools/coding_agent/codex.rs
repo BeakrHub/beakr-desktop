@@ -131,8 +131,11 @@ impl LocalCodingRunner for CodexRunner {
 
         match v["type"].as_str() {
             Some("thread.started") => match v["thread_id"].as_str() {
+                // No model here: Codex does not expose one in its stream —
+                // the card shows the CLI alone (ENG-1581).
                 Some(tid) => ParsedLine::Chunk(Chunk {
                     session_id: Some(tid.to_string()),
+                    cli: Some("codex"),
                     ..Chunk::bare("session")
                 }),
                 None => ParsedLine::Ignore,
@@ -287,10 +290,12 @@ mod tests {
     #[test]
     fn thread_started_yields_session_chunk() {
         let line = r#"{"type":"thread.started","thread_id":"0199-abc"}"#;
+        // ENG-1581: names the CLI; no model — Codex doesn't expose one.
         assert_eq!(
             parse(line),
             ParsedLine::Chunk(Chunk {
                 session_id: Some("0199-abc".into()),
+                cli: Some("codex"),
                 ..Chunk::bare("session")
             })
         );
