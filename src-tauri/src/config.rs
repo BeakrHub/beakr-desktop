@@ -17,6 +17,18 @@ pub struct Settings {
     /// Optional explicit path to the `claude` binary (Settings override for
     /// the login-shell/well-known-path resolution).
     pub claude_binary_path: Option<String>,
+    /// Which CLI a run uses when the engine doesn't request one explicitly
+    /// ("claude" | "codex"). None = claude (the pre-picker behavior).
+    pub default_cli: Option<String>,
+    /// Outcome of the most recent real run's auth, per CLI (ENG-1536).
+    /// `true` after a successful run, `false` after an auth_failed one. This
+    /// is the strongest login signal we have that costs nothing: readiness
+    /// NEVER probes the CLI (a probe against a logged-in CLI is a real,
+    /// quota-burning API call — David 2026-07-17). Self-healing: if a stale
+    /// `true` lets a run through after a logout, that run fails typed as
+    /// auth_failed and flips this to `false`.
+    pub claude_auth_ok: Option<bool>,
+    pub codex_auth_ok: Option<bool>,
 }
 
 pub fn load_settings(app: &AppHandle) -> Settings {
@@ -47,13 +59,41 @@ pub fn load_settings(app: &AppHandle) -> Settings {
         .get("claude_binary_path")
         .and_then(|v| serde_json::from_value(v).ok());
 
+    let default_cli: Option<String> = store
+        .get("default_cli")
+        .and_then(|v| serde_json::from_value(v).ok());
+
+    let claude_auth_ok: Option<bool> = store.get("claude_auth_ok").and_then(|v| v.as_bool());
+    let codex_auth_ok: Option<bool> = store.get("codex_auth_ok").and_then(|v| v.as_bool());
+
     Settings {
         scoped_folders,
         device_name,
         auto_connect,
         anthropic_api_key,
         claude_binary_path,
+        default_cli,
+        claude_auth_ok,
+        codex_auth_ok,
     }
+}
+
+/// Record the auth outcome of a real run (success -> true, auth_failed ->
+/// false) as the zero-cost login signal for readiness (ENG-1536).
+pub fn record_cli_auth(app: &AppHandle, cli: &str, ok: bool) {
+    let store = match app.store(STORE_FILE) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to open store to record cli auth: {e}");
+            return;
+        }
+    };
+    let key = match cli {
+        "claude" => "claude_auth_ok",
+        "codex" => "codex_auth_ok",
+        _ => return,
+    };
+    let _ = store.set(key, serde_json::Value::Bool(ok));
 }
 
 pub fn save_settings(app: &AppHandle, settings: &Settings) {
@@ -90,5 +130,8 @@ pub fn save_settings(app: &AppHandle, settings: &Settings) {
             "claude_binary_path",
             serde_json::to_value(path).unwrap_or_default(),
         );
+    }
+    if let Some(ref cli) = settings.default_cli {
+        store.set("default_cli", serde_json::to_value(cli).unwrap_or_default());
     }
 }

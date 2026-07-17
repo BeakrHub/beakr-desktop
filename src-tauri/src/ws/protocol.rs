@@ -12,6 +12,12 @@ pub enum OutgoingMessage {
         platform_version: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         app_version: Option<String>,
+        /// Per-CLI coding-agent readiness (ENG-1536), additive: the engine
+        /// ignores it until its side lands, then gates the web toggle on it.
+        /// Computed at register time from free signals only — reconnecting
+        /// refreshes it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        coding_agents: Option<Vec<crate::tools::coding_agent::readiness::CliReadiness>>,
     },
     Heartbeat,
     Response {

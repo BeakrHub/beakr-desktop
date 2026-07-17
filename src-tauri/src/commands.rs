@@ -340,6 +340,7 @@ pub async fn get_coding_agent_settings(app: AppHandle) -> Result<serde_json::Val
     Ok(serde_json::json!({
         "has_api_key": settings.anthropic_api_key.map(|k| !k.is_empty()).unwrap_or(false),
         "claude_binary_path": settings.claude_binary_path,
+        "default_cli": settings.default_cli,
     }))
 }
 
@@ -350,6 +351,7 @@ pub async fn set_coding_agent_settings(
     app: AppHandle,
     api_key: Option<String>,
     claude_binary_path: Option<String>,
+    default_cli: Option<String>,
 ) -> Result<(), String> {
     let mut settings = config::load_settings(&app);
     if let Some(key) = api_key {
@@ -358,8 +360,37 @@ pub async fn set_coding_agent_settings(
     if let Some(path) = claude_binary_path {
         settings.claude_binary_path = Some(path);
     }
+    if let Some(cli) = default_cli {
+        if !["claude", "codex"].contains(&cli.as_str()) {
+            return Err(format!("unknown cli '{cli}'"));
+        }
+        settings.default_cli = Some(cli);
+    }
     config::save_settings(&app, &settings);
     Ok(())
+}
+
+/// Per-CLI readiness for the settings UI (ENG-1536): installed / signed in /
+/// version, using only free signals — never a quota-burning probe.
+#[tauri::command]
+pub async fn get_coding_agent_readiness(
+    app: AppHandle,
+) -> Result<Vec<crate::tools::coding_agent::readiness::CliReadiness>, String> {
+    let settings = config::load_settings(&app);
+    let claude = crate::tools::coding_agent::readiness::detect(
+        "claude",
+        settings.claude_binary_path.as_deref(),
+        settings.claude_auth_ok,
+        true,
+    );
+    let codex = crate::tools::coding_agent::readiness::detect(
+        "codex",
+        None,
+        settings.codex_auth_ok,
+        true,
+    );
+    let (claude, codex) = tokio::join!(claude, codex);
+    Ok(vec![claude, codex])
 }
 
 /// The active coding run for the app window (ENG-1552 run visibility) — lets
