@@ -47,9 +47,11 @@ export default function CodingAgentSettings() {
         Coding Agent
       </h2>
       <p style={{ fontSize: "0.78rem", color: "#666", marginTop: 0, marginBottom: "0.75rem" }}>
-        Beakr can run Claude Code on this Mac when you ask it to. If you're
-        logged into Claude Code (any Claude subscription), it works as-is —
-        no setup needed. An API key is optional, only if you'd rather use one.
+        Beakr can run Claude Code or Codex on this Mac when you ask it to.
+        Each uses its own login — if you're signed into Claude Code (any
+        Claude subscription) or Codex (ChatGPT plan), it works as-is, no
+        setup needed. An Anthropic API key is optional, only if you'd rather
+        Claude Code use one; Codex always uses your own login.
       </p>
       {editing ? (
         <div style={{ display: "flex", gap: "0.5rem" }}>
