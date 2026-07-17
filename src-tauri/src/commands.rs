@@ -397,10 +397,15 @@ pub async fn set_coding_agent_settings(
                 false,
             );
             let (claude, codex) = tokio::join!(claude, codex);
+            let agents = vec![claude, codex];
+            let default = crate::tools::coding_agent::readiness::effective_default(
+                settings.default_cli.as_deref(),
+                &agents,
+            );
             let _ = sender
                 .send(crate::ws::protocol::OutgoingMessage::ReadinessUpdate {
-                    coding_agents: vec![claude, codex],
-                    coding_agent_default: settings.default_cli,
+                    coding_agents: agents,
+                    coding_agent_default: Some(default.to_string()),
                 })
                 .await;
         }

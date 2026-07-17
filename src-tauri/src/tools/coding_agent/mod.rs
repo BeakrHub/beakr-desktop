@@ -65,9 +65,23 @@ pub async fn handle_streaming(
     // pre-picker behavior).
     let requested_cli = params.cli.as_deref().or(settings.default_cli.as_deref());
     let runner: &'static dyn LocalCodingRunner = match requested_cli {
-        None | Some("claude") => &claude::ClaudeRunner,
+        Some("claude") => &claude::ClaudeRunner,
         Some("codex") => &codex::CodexRunner,
         Some(other) => return Err(format!("bad_params: unknown cli '{other}'")),
+        None => {
+            // Auto-default (David, 2026-07-17): run the CLI the user actually
+            // HAS — a codex-only machine must not exec a claude binary that
+            // isn't there. Claude wins the tie when both are installed, and
+            // is the fallback when neither is (so the error carries the
+            // primary CLI's install guidance).
+            if binary::resolve("claude", settings.claude_binary_path.as_deref()).is_ok() {
+                &claude::ClaudeRunner
+            } else if binary::resolve("codex", None).is_ok() {
+                &codex::CodexRunner
+            } else {
+                &claude::ClaudeRunner
+            }
+        }
     };
 
     // The CLI's cwd must be inside a user-granted folder, same rule as every
