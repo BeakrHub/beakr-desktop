@@ -199,6 +199,8 @@ pub fn run() {
             commands::get_ws_url,
             commands::get_coding_agent_settings,
             commands::set_coding_agent_settings,
+            commands::get_active_coding_run,
+            commands::stop_coding_run,
             session::commands::connect_session,
             session::commands::benchling_status,
         ])

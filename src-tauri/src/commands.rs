@@ -361,3 +361,24 @@ pub async fn set_coding_agent_settings(
     config::save_settings(&app, &settings);
     Ok(())
 }
+
+/// The active coding run for the app window (ENG-1552 run visibility) — lets
+/// a window opened mid-run catch up before any `coding_run:changed` event.
+#[tauri::command]
+pub fn get_active_coding_run(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::state::ActiveCodingRun>, String> {
+    Ok(state
+        .active_coding_run
+        .read()
+        .expect("active run lock poisoned")
+        .clone())
+}
+
+/// Stop the active coding run from the app window. Shares the tray Stop
+/// path: fires the cancel signal; the run loop SIGINTs the child and moves
+/// the UI to Stopping until the process is confirmed dead.
+#[tauri::command]
+pub fn stop_coding_run(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(crate::state::stop_active_coding_run(&state).is_some())
+}
