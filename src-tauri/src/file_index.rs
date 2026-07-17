@@ -145,7 +145,10 @@ impl FileIndex {
         let access = self.access.lock().unwrap();
 
         let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-        let mut matcher = Matcher::new(Config::DEFAULT);
+        // match_paths tunes scoring for path-shaped haystacks (bonus for the
+        // final segment / after separators), so a basename match still beats a
+        // folder-only match.
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
         let mut buf = Vec::new();
 
         // (match score, access count, mtime, file) for every fuzzy match.
@@ -167,7 +170,11 @@ impl FileIndex {
                         continue;
                     }
                 }
-                let normalized = unicode::normalize_whitespace(&file.name);
+                // Match on the path relative to the scoped root (not just the
+                // basename), so folder-aware queries like "swr hooks" find
+                // lib/hooks/use-...-swr.ts.
+                let rel = rel_path(&file.path, &guard.roots);
+                let normalized = unicode::normalize_whitespace(&rel);
                 let haystack = Utf32Str::new(&normalized, &mut buf);
                 if let Some(score) = pattern.score(haystack, &mut matcher) {
                     let count = access.get(&file.path).copied().unwrap_or(0);
@@ -190,6 +197,19 @@ impl FileIndex {
             .map(|(_, _, _, file)| file.clone())
             .collect()
     }
+}
+
+/// Path relative to whichever scoped root contains it, used as the fuzzy-match
+/// haystack so folder names are searchable. Falls back to the file name.
+fn rel_path(path: &Path, roots: &[String]) -> String {
+    for root in roots {
+        if let Ok(rest) = path.strip_prefix(root) {
+            return rest.to_string_lossy().into_owned();
+        }
+    }
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Recursively refresh `dir` into `next`, reusing `old`'s cached entries for
@@ -439,6 +459,27 @@ mod tests {
         let hits = index.search_names("chatinpt", None, None, 20);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "chat-input.tsx");
+    }
+
+    #[test]
+    fn matches_folder_names_in_the_path() {
+        let tree = TempTree::new("pathmatch");
+        tree.write("lib/hooks/use-thing-swr.ts", "x");
+        tree.write("lib/utils/unrelated.ts", "x");
+        let index = FileIndex::new();
+        index.ensure_fresh(&tree.scoped());
+
+        // "hooks" is only in the folder and "swr" only in the filename — a
+        // basename-only match would miss this; path-aware matching finds it.
+        let hits: Vec<String> = index
+            .search_names("swr hooks", None, None, 20)
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert!(
+            hits.contains(&"use-thing-swr.ts".to_string()),
+            "path-aware match failed: {hits:?}"
+        );
     }
 
     #[test]
