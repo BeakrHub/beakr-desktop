@@ -189,8 +189,8 @@ impl WsClient {
         // Per-CLI readiness rides registration (ENG-1536): free signals only,
         // no version spawn here — keep the connect handshake snappy.
         let settings = crate::config::load_settings(&self.app);
-        let coding_agents = {
-            use crate::tools::coding_agent::readiness::detect;
+        let (coding_agents, coding_agent_default) = {
+            use crate::tools::coding_agent::readiness::{detect, effective_default};
             let claude = detect(
                 "claude",
                 settings.claude_binary_path.as_deref(),
@@ -199,7 +199,12 @@ impl WsClient {
             );
             let codex = detect("codex", None, settings.codex_auth_ok, false);
             let (claude, codex) = tokio::join!(claude, codex);
-            Some(vec![claude, codex])
+            let agents = vec![claude, codex];
+            // Report the EFFECTIVE default (explicit setting, else the CLI
+            // the user actually has) so the web's "via <CLI>" never names a
+            // CLI this machine wouldn't run.
+            let default = effective_default(settings.default_cli.as_deref(), &agents);
+            (Some(agents), Some(default.to_string()))
         };
 
         let register = OutgoingMessage::Register {
@@ -209,7 +214,7 @@ impl WsClient {
             platform_version: Some(os_version()),
             app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             coding_agents,
-            coding_agent_default: settings.default_cli.clone(),
+            coding_agent_default,
         };
 
         let register_json = serde_json::to_string(&register)?;

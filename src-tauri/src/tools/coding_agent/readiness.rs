@@ -226,6 +226,38 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    fn agent(cli: &'static str, installed: bool) -> CliReadiness {
+        CliReadiness {
+            cli,
+            installed,
+            binary_path: None,
+            version: None,
+            login: "unknown",
+            ready: installed,
+        }
+    }
+
+    #[test]
+    fn effective_default_is_the_cli_the_user_actually_has() {
+        // Codex-only machine: defaulting to claude would exec a binary that
+        // isn't there (the bug this function exists to prevent).
+        let codex_only = [agent("claude", false), agent("codex", true)];
+        assert_eq!(effective_default(None, &codex_only), "codex");
+
+        // Both installed: claude wins the tie.
+        let both = [agent("claude", true), agent("codex", true)];
+        assert_eq!(effective_default(None, &both), "claude");
+
+        // Explicit setting beats everything, even an uninstalled-looking one
+        // (the user may have a custom path the probe can't see).
+        assert_eq!(effective_default(Some("codex"), &both), "codex");
+        assert_eq!(effective_default(Some("claude"), &codex_only), "claude");
+
+        // Nothing installed: claude, so the error guidance names the primary.
+        let none = [agent("claude", false), agent("codex", false)];
+        assert_eq!(effective_default(None, &none), "claude");
+    }
+
     #[tokio::test]
     async fn not_installed_is_never_ready_and_never_probes() {
         let r = detect("claude", Some("/nonexistent/claude"), Some(true), true).await;
@@ -233,5 +265,27 @@ mod tests {
         assert!(!r.ready);
         assert_eq!(r.login, "unknown");
         assert!(r.version.is_none());
+    }
+}
+
+/// The CLI a run uses when neither the engine nor the user named one
+/// (David, 2026-07-17): an explicit setting wins; otherwise the CLI the
+/// user actually HAS — claude only wins the tie when both are installed.
+/// A codex-only machine must never default to a claude binary that isn't
+/// there. Falls back to "claude" when nothing is installed, purely so the
+/// resulting binary_not_found error carries the primary CLI's guidance.
+pub fn effective_default(explicit: Option<&str>, agents: &[CliReadiness]) -> &'static str {
+    match explicit {
+        Some("codex") => return "codex",
+        Some("claude") => return "claude",
+        _ => {}
+    }
+    let installed = |cli: &str| agents.iter().any(|a| a.cli == cli && a.installed);
+    if installed("claude") {
+        "claude"
+    } else if installed("codex") {
+        "codex"
+    } else {
+        "claude"
     }
 }
