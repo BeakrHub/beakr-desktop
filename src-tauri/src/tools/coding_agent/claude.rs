@@ -128,8 +128,12 @@ impl LocalCodingRunner for ClaudeRunner {
         match v["type"].as_str() {
             Some("system") => match v["subtype"].as_str() {
                 Some("init") => match v["session_id"].as_str() {
+                    // init also announces the model (ENG-1581): carry it so
+                    // the run card can name its runner.
                     Some(sid) => ParsedLine::Chunk(Chunk {
                         session_id: Some(sid.to_string()),
+                        cli: Some("claude"),
+                        model: v["model"].as_str().map(String::from),
                         ..Chunk::bare("session")
                     }),
                     None => ParsedLine::Ignore,
@@ -224,10 +228,13 @@ mod tests {
     #[test]
     fn init_event_yields_session_chunk() {
         let line = r#"{"type":"system","subtype":"init","session_id":"abc-123","model":"claude-fable-5","tools":["Read","Edit"]}"#;
+        // ENG-1581: the session chunk names its runner and model.
         assert_eq!(
             parse(line),
             ParsedLine::Chunk(Chunk {
                 session_id: Some("abc-123".into()),
+                cli: Some("claude"),
+                model: Some("claude-fable-5".into()),
                 ..Chunk::bare("session")
             })
         );
@@ -418,6 +425,8 @@ mod tests {
             parse(init),
             ParsedLine::Chunk(Chunk {
                 session_id: Some("1853c519-9b0b-4c79-bd97-697f476c516a".into()),
+                cli: Some("claude"),
+                model: Some("claude-opus-4-8".into()),
                 ..Chunk::bare("session")
             })
         );
