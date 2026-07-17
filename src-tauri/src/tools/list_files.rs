@@ -1,5 +1,7 @@
+use std::sync::{Arc, Mutex};
+
+use ignore::{WalkBuilder, WalkState};
 use serde_json::{json, Value};
-use walkdir::WalkDir;
 
 use crate::security;
 use crate::unicode;
@@ -26,71 +28,202 @@ pub async fn handle(
 
     let pattern = params.get("pattern").and_then(|v| v.as_str());
 
-    // Validate path is within scoped folders
+    // Validate path is within scoped folders.
     let canonical = security::validate_path(path, scoped_folders).map_err(|e| e.to_string())?;
 
-    // Compile glob pattern if provided
+    // Compile glob pattern if provided.
     let glob_pattern = match pattern {
         Some(p) => Some(glob::Pattern::new(p).map_err(|e| format!("Invalid glob pattern: {e}"))?),
         None => None,
     };
 
-    let max_depth = if recursive { usize::MAX } else { 1 };
+    // Parallel walk (ripgrep's `ignore` crate). Standard ignore-file/hidden
+    // filtering is disabled to preserve the previous walkdir semantics; the win
+    // is multi-core traversal plus pruning denied directories (node_modules,
+    // .git, …) at the directory level instead of descending and discarding.
+    let mut builder = WalkBuilder::new(&canonical);
+    builder
+        .standard_filters(false)
+        .hidden(false)
+        .parents(false)
+        .follow_links(false)
+        .max_depth(if recursive { None } else { Some(1) });
 
-    let mut files = Vec::new();
+    let root = Arc::new(canonical.clone());
+    let glob_pattern = Arc::new(glob_pattern);
+    let files = Arc::new(Mutex::new(Vec::<Value>::new()));
 
-    let walker = WalkDir::new(&canonical)
-        .max_depth(max_depth)
-        .follow_links(false);
+    builder.build_parallel().run(|| {
+        let root = Arc::clone(&root);
+        let glob_pattern = Arc::clone(&glob_pattern);
+        let files = Arc::clone(&files);
+        Box::new(move |entry| {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return WalkState::Continue,
+            };
+            let entry_path = entry.path();
 
-    for entry in walker.into_iter().filter_map(|e| e.ok()) {
-        // Skip the root directory itself
-        if entry.path() == canonical {
-            continue;
-        }
-
-        let entry_path = entry.path();
-
-        // Silently skip denied files in listings
-        if security::is_denied(entry_path) {
-            continue;
-        }
-
-        let file_name = entry.file_name().to_string_lossy().to_string();
-
-        // Apply glob filter
-        if let Some(ref pat) = glob_pattern {
-            if !pat.matches(&file_name) {
-                continue;
+            // Skip the root directory itself.
+            if entry_path == root.as_path() {
+                return WalkState::Continue;
             }
-        }
 
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
 
-        let file_type = if metadata.is_dir() {
-            "directory"
-        } else if metadata.is_symlink() {
-            "symlink"
-        } else {
-            "file"
-        };
+            // Silently drop denied entries; prune denied directories.
+            if security::is_denied(entry_path) {
+                return if is_dir {
+                    WalkState::Skip
+                } else {
+                    WalkState::Continue
+                };
+            }
 
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+            let file_name = entry.file_name().to_string_lossy().to_string();
 
-        files.push(json!({
-            "name": unicode::normalize_whitespace(&file_name),
-            "path": unicode::normalize_whitespace(&entry_path.display().to_string()),
-            "size": metadata.len(),
-            "type": file_type,
-            "modified_at": modified_at,
-        }));
+            // Apply glob filter to output (non-matching directories are still
+            // descended so their matching children are listed).
+            if let Some(pat) = glob_pattern.as_ref() {
+                if !pat.matches(&file_name) {
+                    return WalkState::Continue;
+                }
+            }
+
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => return WalkState::Continue,
+            };
+
+            let file_type = if metadata.is_dir() {
+                "directory"
+            } else if metadata.is_symlink() {
+                "symlink"
+            } else {
+                "file"
+            };
+
+            let modified_at = metadata
+                .modified()
+                .ok()
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+
+            files.lock().unwrap().push(json!({
+                "name": unicode::normalize_whitespace(&file_name),
+                "path": unicode::normalize_whitespace(&entry_path.display().to_string()),
+                "size": metadata.len(),
+                "type": file_type,
+                "modified_at": modified_at,
+            }));
+            WalkState::Continue
+        })
+    });
+
+    // The parallel walk yields in nondeterministic order; sort by path so the
+    // listing is stable.
+    let mut out = std::mem::take(&mut *files.lock().unwrap());
+    out.sort_by(|a, b| {
+        a.get("path")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("path").and_then(|v| v.as_str()))
+    });
+    Ok((json!({ "files": out }), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempTree {
+        root: PathBuf,
     }
 
-    Ok((json!({ "files": files }), None))
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root =
+                env::temp_dir().join(format!("beakr_list_test_{tag}_{}_{n}", std::process::id()));
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+        fn write(&self, rel: &str, contents: &str) {
+            let path = self.root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, contents).unwrap();
+        }
+        fn scoped(&self) -> Vec<String> {
+            vec![self.root.display().to_string()]
+        }
+        fn path_str(&self) -> String {
+            self.root.display().to_string()
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    fn names(value: &Value) -> Vec<String> {
+        value
+            .get("files")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.get("name").unwrap().as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lists_direct_entries_and_prunes_denied_dirs() {
+        let tree = TempTree::new("direct");
+        tree.write("a.txt", "x");
+        tree.write("sub/b.txt", "x");
+        tree.write("node_modules/pkg/index.js", "x");
+
+        let (value, _) = handle(json!({ "path": tree.path_str() }), &tree.scoped())
+            .await
+            .unwrap();
+        let mut found = names(&value);
+        found.sort();
+        // Non-recursive: direct file + subdir; nested b.txt not listed;
+        // node_modules pruned entirely.
+        assert_eq!(
+            found,
+            vec!["a.txt".to_string(), "sub".to_string()],
+            "got {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_with_glob_filters_and_descends() {
+        let tree = TempTree::new("recursive");
+        tree.write("top.md", "x");
+        tree.write("nested/deep.md", "x");
+        tree.write("nested/skip.txt", "x");
+
+        let (value, _) = handle(
+            json!({ "path": tree.path_str(), "recursive": true, "pattern": "*.md" }),
+            &tree.scoped(),
+        )
+        .await
+        .unwrap();
+        let mut found = names(&value);
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["deep.md".to_string(), "top.md".to_string()],
+            "got {found:?}"
+        );
+    }
 }
