@@ -116,6 +116,13 @@ pub struct AppState {
     /// run visibility). std RwLock on purpose: the tray "Stop run" handler is
     /// synchronous.
     pub active_coding_run: Arc<std::sync::RwLock<Option<ActiveCodingRun>>>,
+    /// Sender into the live WS connection's outbound queue, set while
+    /// connected (ENG-1536). Lets settings changes push a readiness_update
+    /// without waiting for a reconnect. None when disconnected — pushes are
+    /// simply skipped; the next register carries fresh state anyway.
+    pub ws_outbound: Arc<
+        std::sync::RwLock<Option<tokio::sync::mpsc::Sender<crate::ws::protocol::OutgoingMessage>>>,
+    >,
 }
 
 /// Signal cancellation of the active coding run, from the tray or the app
@@ -203,6 +210,7 @@ impl AppState {
             inflight: Arc::new(crate::ws::inflight::InflightRegistry::new()),
             processes: Arc::new(crate::process_group::ProcessRegistry::new()),
             active_coding_run: Arc::new(std::sync::RwLock::new(None)),
+            ws_outbound: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 

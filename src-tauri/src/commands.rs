@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_store::StoreExt;
 
 use crate::config;
@@ -360,13 +360,51 @@ pub async fn set_coding_agent_settings(
     if let Some(path) = claude_binary_path {
         settings.claude_binary_path = Some(path);
     }
-    if let Some(cli) = default_cli {
-        if !["claude", "codex"].contains(&cli.as_str()) {
-            return Err(format!("unknown cli '{cli}'"));
+    let default_changed = match &default_cli {
+        Some(cli) => {
+            if !["claude", "codex"].contains(&cli.as_str()) {
+                return Err(format!("unknown cli '{cli}'"));
+            }
+            settings.default_cli = Some(cli.clone());
+            true
         }
-        settings.default_cli = Some(cli);
-    }
+        None => false,
+    };
     config::save_settings(&app, &settings);
+
+    // Push the new default to the engine while connected (ENG-1536), so the
+    // web's "via <CLI>" display updates without a reconnect. Best-effort:
+    // when disconnected the next register carries fresh state anyway.
+    if default_changed {
+        let state = app.state::<AppState>();
+        let sender = state
+            .ws_outbound
+            .read()
+            .expect("ws_outbound lock poisoned")
+            .clone();
+        if let Some(sender) = sender {
+            let settings = config::load_settings(&app);
+            let claude = crate::tools::coding_agent::readiness::detect(
+                "claude",
+                settings.claude_binary_path.as_deref(),
+                settings.claude_auth_ok,
+                false,
+            );
+            let codex = crate::tools::coding_agent::readiness::detect(
+                "codex",
+                None,
+                settings.codex_auth_ok,
+                false,
+            );
+            let (claude, codex) = tokio::join!(claude, codex);
+            let _ = sender
+                .send(crate::ws::protocol::OutgoingMessage::ReadinessUpdate {
+                    coding_agents: vec![claude, codex],
+                    coding_agent_default: settings.default_cli,
+                })
+                .await;
+        }
+    }
     Ok(())
 }
 
