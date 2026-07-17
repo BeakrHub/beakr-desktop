@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod file_index;
+mod file_watch;
 mod security;
 mod session;
 mod state;
@@ -80,6 +81,9 @@ pub fn run() {
                     if let Some(name) = settings_name {
                         *state.device_name.write().await = name;
                     }
+                    // Start file-index maintenance now that the scoped folders
+                    // are loaded (watcher + periodic rescan fallback).
+                    file_watch::spawn(state.clone());
                 });
             }
 
