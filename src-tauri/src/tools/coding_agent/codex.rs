@@ -33,12 +33,43 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// First ~5 words of a shell command, for the activity label. The full
-/// command rides the "command" chunk for the audit trail.
+/// The item's discriminator. Captured 0.144.5 JSONL uses `"type"`
+/// (`{"item":{"type":"agent_message",...}}`) although docs have shown
+/// `item_type` — accept both, schema-defensively.
+fn item_type(item: &serde_json::Value) -> Option<&str> {
+    item["type"].as_str().or_else(|| item["item_type"].as_str())
+}
+
+/// Codex wraps every command in a login shell (captured fixtures:
+/// `/bin/zsh -lc 'cat hello.txt'`). Unwrap that for the label — the user
+/// should read "Run cat hello.txt", not the wrapper. The FULL original
+/// command still rides the "command" chunk for the audit trail.
+fn unwrap_shell(command: &str) -> &str {
+    for shell in ["/bin/zsh", "/bin/bash", "/bin/sh", "zsh", "bash", "sh"] {
+        for flag in ["-lc", "-c"] {
+            let prefix = format!("{shell} {flag} ");
+            if let Some(inner) = command.strip_prefix(&prefix) {
+                let inner = inner.trim();
+                // Strip one matching layer of quotes if present.
+                for quote in ['\'', '"'] {
+                    if inner.len() >= 2 && inner.starts_with(quote) && inner.ends_with(quote) {
+                        return &inner[1..inner.len() - 1];
+                    }
+                }
+                return inner;
+            }
+        }
+    }
+    command
+}
+
+/// First ~5 words of a shell command (unwrapped from its login-shell
+/// wrapper), for the activity label.
 fn command_label(command: &str) -> String {
-    let short: Vec<&str> = command.split_whitespace().take(5).collect();
+    let display = unwrap_shell(command);
+    let short: Vec<&str> = display.split_whitespace().take(5).collect();
     let mut label = format!("Run {}", short.join(" "));
-    if command.split_whitespace().count() > 5 {
+    if display.split_whitespace().count() > 5 {
         label.push('…');
     }
     label
@@ -62,21 +93,26 @@ impl LocalCodingRunner for CodexRunner {
     }
 
     fn build_command(&self, binary: &Path, spec: &RunSpec) -> Command {
+        // Flag placement is load-bearing and was verified against the real
+        // binary (0.144.5, 2026-07-17): the `resume` subcommand REJECTS
+        // --sandbox/--cd/--skip-git-repo-check, but accepts them at the
+        // parent `exec` level BEFORE the subcommand — where they then apply
+        // to the resumed turn. Canonical shape (works for fresh and resume):
+        //   codex exec --json --sandbox workspace-write --skip-git-repo-check
+        //     --cd <dir> [resume <thread_id>] -- <prompt>
         let mut cmd = Command::new(binary);
         cmd.current_dir(&spec.working_dir);
-        cmd.arg("exec");
-        if let Some(session) = &spec.session_id {
-            // Resume is a subcommand, not a flag: `codex exec resume <id>`.
-            cmd.args(["resume", session]);
-        }
-        cmd.arg("--json")
+        cmd.arg("exec")
+            .arg("--json")
             .args(["--sandbox", "workspace-write"])
             .arg("--skip-git-repo-check")
             .arg("--cd")
-            .arg(&spec.working_dir)
-            // Prompt last: positional, after every flag.
-            .arg("--")
-            .arg(&spec.prompt);
+            .arg(&spec.working_dir);
+        if let Some(session) = &spec.session_id {
+            cmd.args(["resume", session]);
+        }
+        // Prompt last: positional, after every flag.
+        cmd.arg("--").arg(&spec.prompt);
         // spec.api_key is the user's ANTHROPIC key for the Claude adapter —
         // never injected here. Codex uses its own `codex login` credential.
         cmd
@@ -105,7 +141,7 @@ impl LocalCodingRunner for CodexRunner {
             // A command begins: show it on the activity line immediately.
             Some("item.started") => {
                 let item = &v["item"];
-                match item["item_type"].as_str() {
+                match item_type(item) {
                     Some("command_execution") => match item["command"].as_str() {
                         Some(cmd) => ParsedLine::Chunk(Chunk {
                             text: Some(command_label(cmd)),
@@ -119,7 +155,7 @@ impl LocalCodingRunner for CodexRunner {
 
             Some("item.completed") => {
                 let item = &v["item"];
-                match item["item_type"].as_str() {
+                match item_type(item) {
                     // The agent's message. Codex has no single terminal
                     // "result" event; the LAST agent_message is the answer,
                     // so each one is emitted as Final and the orchestrator's
@@ -262,7 +298,7 @@ mod tests {
 
     #[test]
     fn agent_message_yields_final_with_answer() {
-        let line = r#"{"type":"item.completed","item":{"id":"item_2","item_type":"agent_message","text":"Done - I added the endpoint."}}"#;
+        let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Done - I added the endpoint."}}"#;
         assert_eq!(
             parse(line),
             ParsedLine::Final(RunResult {
@@ -274,28 +310,72 @@ mod tests {
 
     #[test]
     fn command_start_labels_activity_and_completion_records_command() {
-        let started = r#"{"type":"item.started","item":{"id":"item_0","item_type":"command_execution","command":"npm test -- --coverage --watchAll=false --json","status":"in_progress"}}"#;
+        // Captured verbatim from codex-cli 0.144.5 (2026-07-17): commands
+        // arrive wrapped in a login shell. The label unwraps it; the command
+        // chunk keeps the full original for the audit trail.
+        let started = r#"{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"/bin/zsh -lc 'cat hello.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#;
         assert_eq!(
             parse(started),
             ParsedLine::Chunk(Chunk {
-                text: Some("Run npm test -- --coverage --watchAll=false…".into()),
+                text: Some("Run cat hello.txt".into()),
                 ..Chunk::bare("tool")
             })
         );
 
-        let completed = r#"{"type":"item.completed","item":{"id":"item_0","item_type":"command_execution","command":"npm test -- --coverage --watchAll=false --json","exit_code":0,"status":"completed"}}"#;
+        let completed = r#"{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"/bin/zsh -lc 'cat hello.txt'","aggregated_output":"hi\n","exit_code":0,"status":"completed"}}"#;
         assert_eq!(
             parse(completed),
             ParsedLine::Chunk(Chunk {
-                command: Some("npm test -- --coverage --watchAll=false --json".into()),
+                command: Some("/bin/zsh -lc 'cat hello.txt'".into()),
                 ..Chunk::bare("command")
             })
         );
     }
 
     #[test]
+    fn unwrap_shell_handles_wrappers_quotes_and_bare_commands() {
+        assert_eq!(unwrap_shell("/bin/zsh -lc 'cat hello.txt'"), "cat hello.txt");
+        assert_eq!(unwrap_shell(r#"/bin/bash -c "npm test""#), "npm test");
+        assert_eq!(unwrap_shell("bash -lc ls"), "ls");
+        // Not a recognized wrapper — untouched.
+        assert_eq!(unwrap_shell("cargo build --release"), "cargo build --release");
+    }
+
+    #[test]
+    fn long_commands_truncate_at_five_words_after_unwrapping() {
+        assert_eq!(
+            command_label("/bin/zsh -lc 'npm test -- --coverage --watchAll=false --json'"),
+            "Run npm test -- --coverage --watchAll=false…"
+        );
+    }
+
+    #[test]
+    fn file_change_double_emit_only_counts_completed() {
+        // Captured: file_change items arrive TWICE — in_progress on
+        // item.started, then completed. Only the completion may emit, or
+        // every changed file would be double-counted in the audit row.
+        let started = r#"{"type":"item.started","item":{"id":"item_1","type":"file_change","changes":[{"path":"/repo/hello.txt","kind":"add"}],"status":"in_progress"}}"#;
+        assert_eq!(parse(started), ParsedLine::Ignore);
+    }
+
+    #[test]
+    fn intermediate_agent_message_is_overwritten_by_the_last_one() {
+        // Captured: Codex narrates ("I'll create the two files...") via an
+        // agent_message BEFORE doing the work, then summarizes at the end.
+        // Both parse as Final; the orchestrator keeps the newest — pin that
+        // both are Final so that contract holds.
+        let plan = r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'll create the two files, display hello.txt, then remove DELETEME.txt as requested."}}"#;
+        let summary = r#"{"type":"item.completed","item":{"id":"item_6","type":"agent_message","text":"Created hello.txt containing exactly hi."}}"#;
+        assert!(matches!(parse(plan), ParsedLine::Final(_)));
+        let ParsedLine::Final(result) = parse(summary) else {
+            panic!("expected Final");
+        };
+        assert_eq!(result.result.as_deref(), Some("Created hello.txt containing exactly hi."));
+    }
+
+    #[test]
     fn file_change_yields_one_chunk_per_path_with_mapped_kinds() {
-        let line = r#"{"type":"item.completed","item":{"id":"item_1","item_type":"file_change","status":"completed","changes":[{"path":"/repo/src/app.py","kind":"update"},{"path":"/repo/NEW.md","kind":"add"},{"path":"/repo/old.txt","kind":"delete"}]}}"#;
+        let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"file_change","status":"completed","changes":[{"path":"/repo/src/app.py","kind":"update"},{"path":"/repo/NEW.md","kind":"add"},{"path":"/repo/old.txt","kind":"delete"}]}}"#;
         assert_eq!(
             parse(line),
             ParsedLine::Chunks(vec![
@@ -339,8 +419,8 @@ mod tests {
         // Codex documents its schema as additive/version-dependent.
         for line in [
             r#"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}"#,
-            r#"{"type":"item.completed","item":{"item_type":"reasoning","text":"thinking"}}"#,
-            r#"{"type":"item.completed","item":{"item_type":"web_search","query":"docs"}}"#,
+            r#"{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}"#,
+            r#"{"type":"item.completed","item":{"type":"web_search","query":"docs"}}"#,
             r#"{"type":"some.future.event","payload":{}}"#,
             "not json at all",
         ] {
@@ -377,11 +457,15 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args[0], "exec");
-        assert_eq!(args[1], "resume");
-        assert_eq!(args[2], "0199-abc");
-        assert!(args.contains(&"--json".to_string()));
-        assert!(args.contains(&"workspace-write".to_string()));
-        assert!(args.contains(&"--skip-git-repo-check".to_string()));
+        // Verified against the real binary: flags must PRECEDE the resume
+        // subcommand (resume itself rejects --sandbox/--cd), prompt comes
+        // last after `--`.
+        let resume_pos = args.iter().position(|a| a == "resume").expect("resume present");
+        assert_eq!(args[resume_pos + 1], "0199-abc");
+        for flag in ["--json", "workspace-write", "--skip-git-repo-check", "--cd"] {
+            let pos = args.iter().position(|a| a == flag).unwrap_or_else(|| panic!("{flag} missing"));
+            assert!(pos < resume_pos, "{flag} must precede the resume subcommand");
+        }
         assert_eq!(args.last().unwrap(), "continue");
         // The user's Anthropic key is Claude-only; Codex uses its own login.
         assert!(!std_cmd
