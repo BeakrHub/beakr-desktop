@@ -118,8 +118,11 @@ pub async fn handle(
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
 
             if is_dir {
-                // Prune denied directories entirely (never descend).
-                if security::is_denied(entry_path) {
+                // Prune denied (sensitive) and noise (build/cache) directories
+                // entirely — never descend.
+                if security::is_denied(entry_path)
+                    || crate::search_filter::is_excluded_dir(entry_path)
+                {
                     return WalkState::Skip;
                 }
                 return WalkState::Continue;

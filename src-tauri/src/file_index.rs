@@ -228,6 +228,11 @@ fn scan_dir(dir: &Path, old: &IndexState, next: &mut IndexState) {
                     continue; // prune denied dirs and files at build time
                 }
                 if file_type.is_dir() {
+                    // Skip build/cache noise directories (recall-safe: generic
+                    // names only when a sibling manifest proves a build tree).
+                    if crate::search_filter::is_excluded_dir(&path) {
+                        continue;
+                    }
                     dirs.push(path);
                 } else if file_type.is_file() {
                     let name = entry.file_name().to_string_lossy().to_string();
@@ -434,6 +439,49 @@ mod tests {
         let hits = index.search_names("chatinpt", None, None, 20);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "chat-input.tsx");
+    }
+
+    #[test]
+    fn excludes_build_noise_keeps_real_source() {
+        let tree = TempTree::new("noise");
+        // The exact junk the repro surfaced: a real source file plus a mangled
+        // .next build chunk that fuzzy-matches the same query.
+        tree.write("components/chat/chat-input.tsx", "x");
+        tree.write(
+            ".next/dev/static/chunks/components_chat_chat-input_tsx_0b3o._.js",
+            "x",
+        );
+        let index = FileIndex::new();
+        index.ensure_fresh(&tree.scoped());
+
+        let hits: Vec<String> = index
+            .search_names("chat input", None, None, 20)
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert!(hits.contains(&"chat-input.tsx".to_string()), "got {hits:?}");
+        assert!(
+            hits.iter().all(|n| !n.contains("_tsx_")),
+            "build junk leaked into results: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn generic_build_dir_pruned_only_with_manifest() {
+        // No manifest beside `build`: a user's real folder stays searchable.
+        let keep = TempTree::new("keep");
+        keep.write("build/house-plan.md", "x");
+        let idx1 = FileIndex::new();
+        idx1.ensure_fresh(&keep.scoped());
+        assert_eq!(idx1.search_names("house plan", None, None, 20).len(), 1);
+
+        // package.json beside `dist`: it is a build tree, so prune it.
+        let proj = TempTree::new("proj");
+        proj.write("package.json", "{}");
+        proj.write("dist/bundle.min.js", "x");
+        let idx2 = FileIndex::new();
+        idx2.ensure_fresh(&proj.scoped());
+        assert_eq!(idx2.search_names("bundle", None, None, 20).len(), 0);
     }
 
     // Benchmark, not a correctness test. Run with:

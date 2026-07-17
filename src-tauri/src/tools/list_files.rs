@@ -71,13 +71,16 @@ pub async fn handle(
 
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
 
-            // Silently drop denied entries; prune denied directories.
+            // Prune denied (sensitive) and noise (build/cache) directories;
+            // silently drop denied files.
+            if is_dir
+                && (security::is_denied(entry_path)
+                    || crate::search_filter::is_excluded_dir(entry_path))
+            {
+                return WalkState::Skip;
+            }
             if security::is_denied(entry_path) {
-                return if is_dir {
-                    WalkState::Skip
-                } else {
-                    WalkState::Continue
-                };
+                return WalkState::Continue;
             }
 
             let file_name = entry.file_name().to_string_lossy().to_string();
