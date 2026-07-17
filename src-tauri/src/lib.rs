@@ -201,6 +201,7 @@ pub fn run() {
             commands::set_coding_agent_settings,
             commands::get_active_coding_run,
             commands::stop_coding_run,
+            commands::get_coding_agent_readiness,
             session::commands::connect_session,
             session::commands::benchling_status,
         ])

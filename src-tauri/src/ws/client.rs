@@ -186,12 +186,29 @@ impl WsClient {
         let device_name = self.state.device_name.read().await.clone();
         let scoped_folders = self.state.scoped_folders.read().await.clone();
 
+        // Per-CLI readiness rides registration (ENG-1536): free signals only,
+        // no version spawn here — keep the connect handshake snappy.
+        let settings = crate::config::load_settings(&self.app);
+        let coding_agents = {
+            use crate::tools::coding_agent::readiness::detect;
+            let claude = detect(
+                "claude",
+                settings.claude_binary_path.as_deref(),
+                settings.claude_auth_ok,
+                false,
+            );
+            let codex = detect("codex", None, settings.codex_auth_ok, false);
+            let (claude, codex) = tokio::join!(claude, codex);
+            Some(vec![claude, codex])
+        };
+
         let register = OutgoingMessage::Register {
             device_name,
             platform: current_platform().to_string(),
             scoped_folders,
             platform_version: Some(os_version()),
             app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            coding_agents,
         };
 
         let register_json = serde_json::to_string(&register)?;
