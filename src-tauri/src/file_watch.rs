@@ -46,7 +46,9 @@ pub fn spawn(state: AppState) {
             // Keep the watcher alive for as long as these roots are current.
             let _watcher = build_watcher(&folders, state.file_index.clone());
             // A new folder set makes these roots (and the watcher) stale.
-            state.folders_changed.notified().await;
+            // Waits on the watcher's own channel — sharing folders_changed
+            // with the WS client starved one of them (ENG-1624).
+            state.watch_folders_changed.notified().await;
             state.file_index.mark_dirty();
         }
     });

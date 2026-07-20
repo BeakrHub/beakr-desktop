@@ -99,8 +99,9 @@ pub async fn set_scoped_folders(
     };
     config::save_settings(&app, &settings);
 
-    // Notify the WS client to push updated folders to backend
-    state.folders_changed.notify_one();
+    // Wake both consumers of the change: the WS client (pushes the new list
+    // to the backend) and the fs watcher (rebinds to the new roots).
+    state.notify_folders_changed();
 
     Ok(())
 }
