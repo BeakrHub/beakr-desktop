@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod file_index;
 mod security;
 mod session;
 mod state;
