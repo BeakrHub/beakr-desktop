@@ -15,18 +15,22 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
+
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::security;
 use crate::unicode;
 
-/// One indexed file. Ranking metadata (mtime, etc.) is added in the ranking
-/// slice (PR3) where it is actually consumed.
+/// One indexed file.
 #[derive(Clone)]
 pub struct FileMeta {
     pub path: PathBuf,
     pub name: String,
+    /// Modification time, used as a recency signal when ranking results.
+    pub modified: Option<SystemTime>,
 }
 
 /// A full snapshot of the indexed trees, keyed by directory.
@@ -46,6 +50,9 @@ struct IndexState {
 /// Thread-safe metadata cache over the scoped folders.
 pub struct FileIndex {
     state: RwLock<IndexState>,
+    /// How many times each path has been read via the `read_file` tool. A
+    /// frecency signal that boosts files the agent keeps returning to.
+    access: Mutex<HashMap<PathBuf, u32>>,
 }
 
 impl Default for FileIndex {
@@ -58,7 +65,13 @@ impl FileIndex {
     pub fn new() -> Self {
         Self {
             state: RwLock::new(IndexState::default()),
+            access: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record that `path` was read, boosting its future ranking (frecency).
+    pub fn record_access(&self, path: &Path) {
+        *self.access.lock().unwrap().entry(path.to_path_buf()).or_insert(0) += 1;
     }
 
     /// Refresh the index for `roots`, reusing unchanged directories.
@@ -92,21 +105,30 @@ impl FileIndex {
         *self.state.write().unwrap() = next;
     }
 
-    /// Filename/path search over the cached metadata.
+    /// Ranked filename/path search over the cached metadata.
     ///
-    /// `root_filter`, when set, restricts results to a subtree (the tool's
-    /// optional `path` parameter). Matching is on the normalized basename so an
-    /// ASCII-space query still finds Unicode-whitespace names, mirroring the
-    /// previous walk-based behavior. Returns at most `limit` hits.
+    /// Matching is fuzzy (subsequence, whitespace-split, case-insensitive) via
+    /// `nucleo`, so `chat inpt` finds `chat-input.tsx`. Results are ranked by
+    /// match quality, then frecency (how often the file has been read), then
+    /// recency (newest first), then name for a stable order. `root_filter`, when
+    /// set, restricts to a subtree (the tool's optional `path` parameter).
+    /// Returns at most `limit` hits.
     pub fn search_names(
         &self,
-        query_lower: &str,
+        query: &str,
         root_filter: Option<&Path>,
         file_types: Option<&[String]>,
         limit: usize,
     ) -> Vec<FileMeta> {
         let guard = self.state.read().unwrap();
-        let mut out = Vec::new();
+        let access = self.access.lock().unwrap();
+
+        let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut buf = Vec::new();
+
+        // (match score, access count, mtime, file) for every fuzzy match.
+        let mut scored: Vec<(u32, u32, Option<SystemTime>, &FileMeta)> = Vec::new();
         for files in guard.files.values() {
             for file in files {
                 if let Some(root) = root_filter {
@@ -125,15 +147,27 @@ impl FileIndex {
                     }
                 }
                 let normalized = unicode::normalize_whitespace(&file.name);
-                if normalized.to_lowercase().contains(query_lower) {
-                    out.push(file.clone());
-                    if out.len() >= limit {
-                        return out;
-                    }
+                let haystack = Utf32Str::new(&normalized, &mut buf);
+                if let Some(score) = pattern.score(haystack, &mut matcher) {
+                    let count = access.get(&file.path).copied().unwrap_or(0);
+                    scored.push((score, count, file.modified, file));
                 }
             }
         }
-        out
+        drop(access);
+
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0) // match quality (higher first)
+                .then(b.1.cmp(&a.1)) // frecency (more-read first)
+                .then(b.2.cmp(&a.2)) // recency (newest first)
+                .then(a.3.name.cmp(&b.3.name)) // stable tiebreak
+        });
+
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, _, file)| file.clone())
+            .collect()
     }
 }
 
@@ -176,7 +210,12 @@ fn scan_dir(dir: &Path, old: &IndexState, next: &mut IndexState) {
                     dirs.push(path);
                 } else if file_type.is_file() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    files.push(FileMeta { path, name });
+                    let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+                    files.push(FileMeta {
+                        path,
+                        name,
+                        modified,
+                    });
                 }
             }
         }
@@ -311,5 +350,48 @@ mod tests {
         let hits = index.search_names("target", Some(&subtree), None, 20);
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path.starts_with(&subtree));
+    }
+
+    #[test]
+    fn ranks_closer_match_first() {
+        let tree = TempTree::new("rank");
+        tree.write("cfg.txt", "x"); // "cfg" is a contiguous prefix
+        tree.write("config_grid_helper.txt", "x"); // c..f..g scattered
+        let index = FileIndex::new();
+        index.refresh(&tree.scoped());
+
+        let hits = index.search_names("cfg", None, None, 20);
+        assert_eq!(hits[0].name, "cfg.txt", "closer match should rank first");
+    }
+
+    #[test]
+    fn frecency_boosts_a_read_file() {
+        let tree = TempTree::new("frecency");
+        tree.write("a/config.txt", "x");
+        tree.write("b/config.txt", "x"); // identical basename -> identical match score
+        let index = FileIndex::new();
+        index.refresh(&tree.scoped());
+
+        // With no reads, order is only broken by the stable tiebreak; after
+        // reading b's copy it must rank first on frecency.
+        let b = tree.root.join("b/config.txt");
+        index.record_access(&b);
+        let hits = index.search_names("config", None, None, 20);
+        assert_eq!(hits[0].path, b, "the read file should rank first");
+    }
+
+    #[test]
+    fn fuzzy_matches_subsequence() {
+        let tree = TempTree::new("fuzzy");
+        tree.write("chat-input.tsx", "x");
+        tree.write("unrelated.rs", "x");
+        let index = FileIndex::new();
+        index.refresh(&tree.scoped());
+
+        // "chatinpt" is not a substring of "chat-input.tsx" (the dash breaks it)
+        // but is a subsequence — the point of fuzzy matching.
+        let hits = index.search_names("chatinpt", None, None, 20);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "chat-input.tsx");
     }
 }

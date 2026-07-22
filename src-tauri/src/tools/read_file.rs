@@ -3,6 +3,7 @@ use std::io::{BufReader, Read};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 
+use crate::file_index::FileIndex;
 use crate::security;
 
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
@@ -17,6 +18,7 @@ const BINARY_CHECK_SIZE: usize = 8192;
 pub async fn handle(
     params: Value,
     scoped_folders: &[String],
+    index: &FileIndex,
 ) -> Result<(Value, Option<u64>), String> {
     let path = params
         .get("path")
@@ -49,6 +51,9 @@ pub async fn handle(
     if metadata.is_dir() {
         return Err("Cannot read a directory. Use list_files instead.".to_string());
     }
+
+    // Record the read so this file ranks higher in future searches (frecency).
+    index.record_access(&canonical);
 
     // Binary detection: check first 8KB for null bytes
     let file = std::fs::File::open(&canonical).map_err(|e| format!("Cannot open file: {e}"))?;
