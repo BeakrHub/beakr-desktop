@@ -8,6 +8,7 @@
 
 mod binary;
 mod claude;
+mod codex;
 pub mod runner;
 
 use std::time::Duration;
@@ -60,7 +61,7 @@ pub async fn handle_streaming(
     // Adapter selection (detect+default is a Settings concern; explicit here).
     let runner: &'static dyn LocalCodingRunner = match params.cli.as_deref() {
         None | Some("claude") => &claude::ClaudeRunner,
-        Some("codex") => return Err("bad_params: codex adapter lands with ENG-1529".into()),
+        Some("codex") => &codex::CodexRunner,
         Some(other) => return Err(format!("bad_params: unknown cli '{other}'")),
     };
 
@@ -91,7 +92,15 @@ pub async fn handle_streaming(
     // pre-flight guess needed. Beakr never handles the subscription credential.
     let api_key = settings.anthropic_api_key.clone().filter(|k| !k.is_empty());
 
-    let binary = binary::resolve(runner.name(), settings.claude_binary_path.as_deref())?;
+    // The settings override is per-CLI: claude_binary_path must never route a
+    // codex run to the claude binary. A codex_binary_path setting can land
+    // with the ENG-1536 readiness/picker work; until then codex resolves via
+    // the standard PATH probe in binary::resolve.
+    let binary_override = match runner.name() {
+        "claude" => settings.claude_binary_path.as_deref(),
+        _ => None,
+    };
+    let binary = binary::resolve(runner.name(), binary_override)?;
 
     let working_dir_display = working_dir.to_string_lossy().into_owned();
     let spec = RunSpec {
