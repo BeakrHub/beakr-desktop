@@ -176,6 +176,7 @@ dependencies = [
  "hostname",
  "http",
  "ignore",
+ "libc",
  "log",
  "notify",
  "nucleo-matcher",

@@ -76,6 +76,12 @@ pub struct AppState {
     /// logs in. `None` until a successful connect; the live `benchling_*` tools
     /// return a reconnect error while it is `None` or after the session expires.
     pub benchling_session: Arc<RwLock<Option<BenchlingSession>>>,
+    /// In-flight request tracking: cancellation signals + the one-coding-run
+    /// cap (ENG-1527). Shared state because cancels arrive from the engine
+    /// (WS `cancel`) and, later, the local UI (tray "Stop run").
+    pub inflight: Arc<crate::ws::inflight::InflightRegistry>,
+    /// Live child process groups, reaped on quit (ENG-1527).
+    pub processes: Arc<crate::process_group::ProcessRegistry>,
 }
 
 impl AppState {
@@ -97,6 +103,8 @@ impl AppState {
             watch_folders_changed: Arc::new(tokio::sync::Notify::new()),
             file_index: Arc::new(crate::file_index::FileIndex::new()),
             benchling_session: Arc::new(RwLock::new(None)),
+            inflight: Arc::new(crate::ws::inflight::InflightRegistry::new()),
+            processes: Arc::new(crate::process_group::ProcessRegistry::new()),
         }
     }
 

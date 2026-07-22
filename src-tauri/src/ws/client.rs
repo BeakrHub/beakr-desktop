@@ -27,6 +27,9 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often we re-check the liveness deadline.
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Outbound frame buffer between spawned request tasks and the socket loop.
+/// Sized for bursts of streamed chunks; senders await (backpressure) when full.
+const OUTBOUND_BUFFER: usize = 256;
 
 /// WebSocket close codes from the server.
 const CLOSE_REVOKED: u16 = 4010;
@@ -250,6 +253,15 @@ impl WsClient {
         let mut liveness = tokio::time::interval(LIVENESS_CHECK_INTERVAL);
         liveness.tick().await; // consume the first immediate tick
 
+        // Outbound channel for spawned request tasks (ENG-1527). Handlers run
+        // as their own tasks so a minutes-long tool call can't stall this
+        // select loop — stalling it would starve the Ping/Pong liveness cycle
+        // and force a spurious reconnect mid-run (the ENG-1261 detector), and
+        // would serialize every other tool behind the slow one. Tasks send
+        // their frames here; only this loop touches the socket.
+        let (out_tx, mut out_rx) =
+            tokio::sync::mpsc::channel::<OutgoingMessage>(OUTBOUND_BUFFER);
+
         // Time of the last inbound frame of ANY kind. A live link refreshes this
         // on every Ping->Pong round-trip; a half-open socket lets it go stale,
         // which the liveness branch turns into a reconnect. Without this the read
@@ -287,6 +299,22 @@ impl WsClient {
                     }
                 }
 
+                outgoing = out_rx.recv() => {
+                    // recv() can't yield None here: `out_tx` lives in this
+                    // scope for the whole loop, so the channel never closes.
+                    if let Some(msg) = outgoing {
+                        match serde_json::to_string(&msg) {
+                            Ok(json) => {
+                                if let Err(e) = write.send(Message::Text(json)).await {
+                                    log::error!("Failed to send outgoing frame: {e}");
+                                    return None;
+                                }
+                            }
+                            Err(e) => log::error!("Failed to serialize outgoing frame: {e}"),
+                        }
+                    }
+                }
+
                 msg = read.next() => {
                     match msg {
                         Some(Ok(message)) => {
@@ -295,7 +323,7 @@ impl WsClient {
                             last_inbound = Instant::now();
                             match message {
                                 Message::Text(text) => {
-                                    self.handle_text_message(&text, write).await;
+                                    self.handle_text_message(&text, &out_tx);
                                 }
                                 Message::Close(frame) => {
                                     let code = frame.as_ref().map(|f| f.code.into());
@@ -341,14 +369,13 @@ impl WsClient {
         }
     }
 
-    /// Handle an incoming text message (tool request).
-    async fn handle_text_message(
+    /// Handle an incoming text message. Requests are dispatched as their own
+    /// tasks (never awaited here — see the outbound-channel note in
+    /// `message_loop`); cancels resolve against the in-flight registry.
+    fn handle_text_message(
         &self,
         text: &str,
-        write: &mut futures_util::stream::SplitSink<
-            WebSocketStream<MaybeTlsStream<TcpStream>>,
-            Message,
-        >,
+        out_tx: &tokio::sync::mpsc::Sender<OutgoingMessage>,
     ) {
         let incoming: IncomingMessage = match serde_json::from_str(text) {
             Ok(m) => m,
@@ -364,63 +391,18 @@ impl WsClient {
                 tool,
                 params,
             } => {
-                let scoped_folders = self.state.scoped_folders.read().await.clone();
-
-                // Notify frontend that a tool request started
-                let _ = self.app.emit(
-                    "tool:request_started",
-                    serde_json::json!({
-                        "request_id": &request_id,
-                        "tool": &tool,
-                        "params": &params,
-                    }),
-                );
-
-                let response =
-                    tools::dispatch_request(&tool, params, &scoped_folders, &self.state).await;
-
-                let (outgoing, result_status) = match response {
-                    Ok((data, bytes)) => (
-                        OutgoingMessage::Response {
-                            request_id: request_id.clone(),
-                            status: ResponseStatus::Success,
-                            data: Some(data),
-                            error: None,
-                            bytes_transferred: bytes,
-                        },
-                        "success",
-                    ),
-                    Err(e) => (
-                        OutgoingMessage::Response {
-                            request_id: request_id.clone(),
-                            status: ResponseStatus::Error,
-                            data: None,
-                            error: Some(e),
-                            bytes_transferred: None,
-                        },
-                        "error",
-                    ),
-                };
-
-                // Notify frontend that the request completed
-                let _ = self.app.emit(
-                    "tool:request_completed",
-                    serde_json::json!({
-                        "request_id": &request_id,
-                        "status": result_status,
-                    }),
-                );
-
-                let json = match serde_json::to_string(&outgoing) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        log::error!("Failed to serialize response: {e}");
-                        return;
-                    }
-                };
-
-                if let Err(e) = write.send(Message::Text(json)).await {
-                    log::error!("Failed to send response: {e}");
+                let app = self.app.clone();
+                let state = self.state.clone();
+                let out_tx = out_tx.clone();
+                tokio::spawn(run_request(app, state, request_id, tool, params, out_tx));
+            }
+            IncomingMessage::Cancel { request_id } => {
+                if self.state.inflight.cancel(&request_id) {
+                    log::info!("Cancelled in-flight request {request_id}");
+                } else {
+                    // Protocol contract: cancelling an unknown/finished id is
+                    // a no-op (the terminal response may already be in flight).
+                    log::debug!("Cancel for unknown/finished request {request_id}");
                 }
             }
             IncomingMessage::Registered { .. } => {
@@ -434,6 +416,81 @@ impl WsClient {
         let status_str = serde_json::to_value(&status).ok();
         *self.state.ws_status.write().await = status;
         let _ = self.app.emit("ws:status_changed", status_str);
+    }
+}
+
+/// Body of one spawned request task (ENG-1527): register for cancellation,
+/// run the tool, always emit exactly one terminal `Response` — success, error,
+/// or "cancelled" — so the engine side never hangs on a cancelled request.
+async fn run_request(
+    app: AppHandle,
+    state: AppState,
+    request_id: String,
+    tool: String,
+    params: serde_json::Value,
+    out_tx: tokio::sync::mpsc::Sender<OutgoingMessage>,
+) {
+    let scoped_folders = state.scoped_folders.read().await.clone();
+    let mut cancel = state.inflight.register(&request_id);
+
+    // Notify frontend that a tool request started
+    let _ = app.emit(
+        "tool:request_started",
+        serde_json::json!({
+            "request_id": &request_id,
+            "tool": &tool,
+            "params": &params,
+        }),
+    );
+
+    // Read-only tools are safely droppable mid-flight, so a plain select is
+    // enough. Handlers that must clean up on cancel (the coding runs of
+    // ENG-1528) receive the signal themselves via the registry instead of
+    // relying on this outer race.
+    let response = tokio::select! {
+        r = tools::dispatch_request(&tool, params, &scoped_folders, &state) => r,
+        _ = cancel.cancelled() => Err("cancelled by server".to_string()),
+    };
+
+    state.inflight.finish(&request_id);
+
+    let (outgoing, result_status) = match response {
+        Ok((data, bytes)) => (
+            OutgoingMessage::Response {
+                request_id: request_id.clone(),
+                status: ResponseStatus::Success,
+                data: Some(data),
+                error: None,
+                bytes_transferred: bytes,
+            },
+            "success",
+        ),
+        Err(e) => (
+            OutgoingMessage::Response {
+                request_id: request_id.clone(),
+                status: ResponseStatus::Error,
+                data: None,
+                error: Some(e),
+                bytes_transferred: None,
+            },
+            "error",
+        ),
+    };
+
+    // Notify frontend that the request completed
+    let _ = app.emit(
+        "tool:request_completed",
+        serde_json::json!({
+            "request_id": &request_id,
+            "status": result_status,
+        }),
+    );
+
+    // A send failure means the connection this request arrived on is gone;
+    // the engine's request future died with it, so dropping the response
+    // mirrors the pre-ENG-1527 behavior.
+    if out_tx.send(outgoing).await.is_err() {
+        log::warn!("Connection closed before response for {request_id} could be sent");
     }
 }
 
