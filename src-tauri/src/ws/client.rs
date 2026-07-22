@@ -186,12 +186,35 @@ impl WsClient {
         let device_name = self.state.device_name.read().await.clone();
         let scoped_folders = self.state.scoped_folders.read().await.clone();
 
+        // Per-CLI readiness rides registration (ENG-1536): free signals only,
+        // no version spawn here — keep the connect handshake snappy.
+        let settings = crate::config::load_settings(&self.app);
+        let (coding_agents, coding_agent_default) = {
+            use crate::tools::coding_agent::readiness::{detect, effective_default};
+            let claude = detect(
+                "claude",
+                settings.claude_binary_path.as_deref(),
+                settings.claude_auth_ok,
+                false,
+            );
+            let codex = detect("codex", None, settings.codex_auth_ok, false);
+            let (claude, codex) = tokio::join!(claude, codex);
+            let agents = vec![claude, codex];
+            // Report the EFFECTIVE default (explicit setting, else the CLI
+            // the user actually has) so the web's "via <CLI>" never names a
+            // CLI this machine wouldn't run.
+            let default = effective_default(settings.default_cli.as_deref(), &agents);
+            (Some(agents), Some(default.to_string()))
+        };
+
         let register = OutgoingMessage::Register {
             device_name,
             platform: current_platform().to_string(),
             scoped_folders,
             platform_version: Some(os_version()),
             app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            coding_agents,
+            coding_agent_default,
         };
 
         let register_json = serde_json::to_string(&register)?;
@@ -261,6 +284,17 @@ impl WsClient {
         // their frames here; only this loop touches the socket.
         let (out_tx, mut out_rx) =
             tokio::sync::mpsc::channel::<OutgoingMessage>(OUTBOUND_BUFFER);
+
+        // Expose the outbound queue so settings changes can push a
+        // readiness_update mid-connection (ENG-1536). Cleared on every exit
+        // path below via the guard — a stale sender would silently drop
+        // pushes into a dead channel.
+        *self
+            .state
+            .ws_outbound
+            .write()
+            .expect("ws_outbound lock poisoned") = Some(out_tx.clone());
+        let _outbound_guard = OutboundGuard(self.state.ws_outbound.clone());
 
         // Time of the last inbound frame of ANY kind. A live link refreshes this
         // on every Ping->Pong round-trip; a half-open socket lets it go stale,
@@ -621,5 +655,19 @@ mod tests {
         // register()) before `is_online` goes stale and strands the Ask "+".
         assert!(PING_INTERVAL < LIVENESS_TIMEOUT);
         assert!(LIVENESS_TIMEOUT < Duration::from_secs(60));
+    }
+}
+
+/// Clears `AppState::ws_outbound` when the connection loop exits by any path
+/// (error, close, shutdown), so no one pushes into a dead channel.
+struct OutboundGuard(
+    std::sync::Arc<
+        std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OutgoingMessage>>>,
+    >,
+);
+
+impl Drop for OutboundGuard {
+    fn drop(&mut self) {
+        *self.0.write().expect("ws_outbound lock poisoned") = None;
     }
 }
