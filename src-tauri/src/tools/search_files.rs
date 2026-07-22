@@ -51,10 +51,9 @@ pub async fn handle(
     // refreshed incrementally (unchanged directories are reused).
     if !search_content {
         index.refresh(scoped_folders);
-        let query_lower = query.to_lowercase();
         let root_filter = path_param.map(PathBuf::from);
         let hits = index.search_names(
-            &query_lower,
+            query,
             root_filter.as_deref(),
             file_types.as_deref(),
             limit,
