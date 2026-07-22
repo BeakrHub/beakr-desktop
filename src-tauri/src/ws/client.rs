@@ -431,7 +431,7 @@ async fn run_request(
     out_tx: tokio::sync::mpsc::Sender<OutgoingMessage>,
 ) {
     let scoped_folders = state.scoped_folders.read().await.clone();
-    let mut cancel = state.inflight.register(&request_id);
+    let cancel = state.inflight.register(&request_id);
 
     // Notify frontend that a tool request started
     let _ = app.emit(
@@ -444,12 +444,19 @@ async fn run_request(
     );
 
     // Read-only tools are safely droppable mid-flight, so a plain select is
-    // enough. Handlers that must clean up on cancel (the coding runs of
-    // ENG-1528) receive the signal themselves via the registry instead of
-    // relying on this outer race.
-    let response = tokio::select! {
-        r = tools::dispatch_request(&tool, params, &scoped_folders, &state) => r,
-        _ = cancel.cancelled() => Err("cancelled by server".to_string()),
+    // enough. Streaming tools (the coding runs of ENG-1528) must clean up
+    // their children on cancel, so they receive the signal itself and manage
+    // their own cancellation instead of being dropped by this outer race.
+    let response = if tools::is_streaming(&tool) {
+        let stream = crate::ws::ToolStream::new(request_id.clone(), out_tx.clone());
+        tools::dispatch_streaming(&app, &state, &tool, params, &scoped_folders, &stream, cancel)
+            .await
+    } else {
+        let mut cancel = cancel;
+        tokio::select! {
+            r = tools::dispatch_request(&tool, params, &scoped_folders, &state) => r,
+            _ = cancel.cancelled() => Err("cancelled by server".to_string()),
+        }
     };
 
     state.inflight.finish(&request_id);

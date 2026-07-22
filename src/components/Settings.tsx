@@ -4,6 +4,7 @@ import BeakrLogo from "./BeakrLogo";
 import ConnectionStatus from "./ConnectionStatus";
 import ActivityFeed from "./ActivityFeed";
 import FolderPicker from "./FolderPicker";
+import CodingAgentSettings from "./CodingAgentSettings";
 import SessionConnect from "./SessionConnect";
 import UpdateBanner from "./UpdateBanner";
 import { useUpdater } from "../hooks/useUpdater";
@@ -151,6 +152,8 @@ export default function Settings({ onUnlink }: SettingsProps) {
       </section>
 
       <FolderPicker />
+
+      <CodingAgentSettings />
 
       <SessionConnect provider="benchling" displayName="Benchling" />
 
