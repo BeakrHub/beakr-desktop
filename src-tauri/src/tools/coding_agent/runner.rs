@@ -42,9 +42,17 @@ pub struct Chunk {
     pub change: Option<&'static str>,
     /// For "cost": the run's total cost so far in USD. `claude -p` only
     /// reports cost on its terminal result event, so today this arrives once
-    /// at the end of the run rather than as live ticks.
+    /// at the end of the run rather than as live ticks. Codex never emits
+    /// this chunk — it reports token usage, not dollars, and converting
+    /// tokens to dollars would assume API pricing that is wrong for the
+    /// ChatGPT-plan users the auth decision targets (DESIGN.md decision 5).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
+    /// For "command": the shell command a sandboxed Codex run executed.
+    /// The engine's audit row collects these (its accumulator already reads
+    /// `command`); Claude never emits it while Bash stays denied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 impl Chunk {
@@ -58,6 +66,7 @@ impl Chunk {
             path: None,
             change: None,
             total_cost_usd: None,
+            command: None,
         }
     }
 }
