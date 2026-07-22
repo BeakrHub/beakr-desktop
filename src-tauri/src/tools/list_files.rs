@@ -6,12 +6,26 @@ use serde_json::{json, Value};
 use crate::security;
 use crate::unicode;
 
+/// Listing order. `Name` preserves the original stable alphabetical contract;
+/// `Modified`/`Size` exist so "most recent file" / "biggest file" questions
+/// get a correct answer instead of the model fishing timestamps out of an
+/// alphabetical wall (ENG-1668).
+#[derive(Clone, Copy, PartialEq)]
+enum SortBy {
+    Name,
+    Modified,
+    Size,
+}
+
 /// Handle a `list_files` request.
 ///
 /// Params:
 /// - `path` (string, required): Directory to list
 /// - `recursive` (bool, optional): Recurse into subdirectories
 /// - `pattern` (string, optional): Glob pattern to filter files
+/// - `sort_by` (string, optional): "name" (default) | "modified" | "size"
+/// - `order` (string, optional): "asc" | "desc" (default: asc for name, desc otherwise)
+/// - `max_results` (number, optional): Cap the listing, applied AFTER sorting
 pub async fn handle(
     params: Value,
     scoped_folders: &[String],
@@ -27,6 +41,25 @@ pub async fn handle(
         .unwrap_or(false);
 
     let pattern = params.get("pattern").and_then(|v| v.as_str());
+
+    let sort_by = match params.get("sort_by").and_then(|v| v.as_str()) {
+        None | Some("name") => SortBy::Name,
+        Some("modified") => SortBy::Modified,
+        Some("size") => SortBy::Size,
+        Some(other) => return Err(format!("Invalid sort_by: {other}")),
+    };
+    // "Newest first" / "biggest first" is what recency and size questions
+    // mean; alphabetical stays ascending.
+    let descending = match params.get("order").and_then(|v| v.as_str()) {
+        Some("asc") => false,
+        Some("desc") => true,
+        None => !matches!(sort_by, SortBy::Name),
+        Some(other) => return Err(format!("Invalid order: {other}")),
+    };
+    let max_results = params
+        .get("max_results")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
 
     // Validate path is within scoped folders.
     let canonical = security::validate_path(path, scoped_folders).map_err(|e| e.to_string())?;
@@ -122,15 +155,42 @@ pub async fn handle(
         })
     });
 
-    // The parallel walk yields in nondeterministic order; sort by path so the
-    // listing is stable.
+    // The parallel walk yields in nondeterministic order; sort for a stable
+    // listing. RFC3339 UTC timestamps compare correctly as strings; entries
+    // without a timestamp sort as oldest. Path is the tiebreak so equal keys
+    // stay deterministic.
     let mut out = std::mem::take(&mut *files.lock().unwrap());
     out.sort_by(|a, b| {
-        a.get("path")
+        let path_cmp = a
+            .get("path")
             .and_then(|v| v.as_str())
-            .cmp(&b.get("path").and_then(|v| v.as_str()))
+            .cmp(&b.get("path").and_then(|v| v.as_str()));
+        let key_cmp = match sort_by {
+            SortBy::Name => path_cmp,
+            SortBy::Modified => a
+                .get("modified_at")
+                .and_then(|v| v.as_str())
+                .cmp(&b.get("modified_at").and_then(|v| v.as_str())),
+            SortBy::Size => a
+                .get("size")
+                .and_then(|v| v.as_u64())
+                .cmp(&b.get("size").and_then(|v| v.as_u64())),
+        };
+        let ordered = if descending { key_cmp.reverse() } else { key_cmp };
+        ordered.then(path_cmp)
     });
-    Ok((json!({ "files": out }), None))
+
+    // Cap AFTER sorting, so "newest N" is the newest N. The engine has always
+    // sent max_results; the pre-index implementation honored it and this
+    // rewrite silently dropped it (ENG-1668) - for a big folder that meant
+    // unbounded payloads and, once anything truncated downstream, the newest
+    // files vanishing alphabetically.
+    let total = out.len();
+    if let Some(cap) = max_results {
+        out.truncate(cap);
+    }
+    let truncated = out.len() < total;
+    Ok((json!({ "files": out, "total_found": total, "truncated": truncated }), None))
 }
 
 #[cfg(test)]
@@ -228,5 +288,75 @@ mod tests {
             vec!["deep.md".to_string(), "top.md".to_string()],
             "got {found:?}"
         );
+    }
+
+    fn backdate(tree: &TempTree, rel: &str, hours_ago: u64) {
+        use std::time::{Duration, SystemTime};
+        let f = fs::File::options()
+            .write(true)
+            .open(tree.root.join(rel))
+            .unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(hours_ago * 3600))
+            .unwrap();
+    }
+
+    // Regression (ENG-1668): "most recently downloaded file" questions were
+    // wrong because the listing was alphabetical-only and the cap was ignored.
+    // The newest file must be FIRST under sort_by=modified, and the cap must
+    // apply after sorting so "newest N" is actually the newest N.
+    #[tokio::test]
+    async fn sort_by_modified_puts_newest_first_and_caps_after_sort() {
+        let tree = TempTree::new("mtime");
+        tree.write("aaa_old.txt", "x");
+        tree.write("mmm_newest.txt", "x");
+        tree.write("zzz_middle.txt", "x");
+        backdate(&tree, "aaa_old.txt", 3);
+        backdate(&tree, "zzz_middle.txt", 2);
+
+        let (value, _) = handle(
+            json!({ "path": tree.path_str(), "sort_by": "modified", "max_results": 2 }),
+            &tree.scoped(),
+        )
+        .await
+        .unwrap();
+
+        // Newest first (desc is the default for modified), capped to 2, and
+        // the alphabetically-first-but-oldest file is the one dropped.
+        assert_eq!(
+            names(&value),
+            vec!["mmm_newest.txt".to_string(), "zzz_middle.txt".to_string()]
+        );
+        assert_eq!(value.get("total_found").unwrap(), 3);
+        assert_eq!(value.get("truncated").unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn max_results_caps_the_default_alphabetical_listing() {
+        let tree = TempTree::new("cap");
+        tree.write("a.txt", "x");
+        tree.write("b.txt", "x");
+        tree.write("c.txt", "x");
+
+        let (value, _) = handle(
+            json!({ "path": tree.path_str(), "max_results": 2 }),
+            &tree.scoped(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(names(&value), vec!["a.txt".to_string(), "b.txt".to_string()]);
+        assert_eq!(value.get("truncated").unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn invalid_sort_by_is_a_clear_error() {
+        let tree = TempTree::new("badsort");
+        let err = handle(
+            json!({ "path": tree.path_str(), "sort_by": "frecency" }),
+            &tree.scoped(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("Invalid sort_by"), "got {err}");
     }
 }
