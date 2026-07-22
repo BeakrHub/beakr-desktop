@@ -17,15 +17,12 @@ use std::sync::Mutex;
 use tokio::process::{Child, Command};
 
 /// A child running in its own process group.
-// Constructed by the coding-run handlers of ENG-1528; the allow comes off then.
-#[allow(dead_code)]
 pub struct GroupChild {
     child: Child,
     #[cfg(unix)]
     pgid: i32,
 }
 
-#[allow(dead_code)] // consumed by ENG-1528 (coding-run adapters)
 impl GroupChild {
     /// Spawn `cmd` in a fresh process group.
     pub fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
@@ -92,11 +89,13 @@ impl GroupChild {
         self.child.stderr.take()
     }
 
+    #[allow(dead_code)] // Codex stdin-prompt path, ENG-1529
     pub fn stdin_take(&mut self) -> Option<tokio::process::ChildStdin> {
         self.child.stdin.take()
     }
 
     #[cfg(unix)]
+    #[allow(dead_code)] // test accessor
     pub fn pgid(&self) -> i32 {
         self.pgid
     }
@@ -130,7 +129,6 @@ impl ProcessRegistry {
     }
 
     #[cfg(unix)]
-    #[allow(dead_code)] // consumed by ENG-1528 (coding-run adapters)
     pub fn register(&self, request_id: &str, child: &GroupChild) {
         if child.pgid > 0 {
             self.groups
@@ -141,10 +139,8 @@ impl ProcessRegistry {
     }
 
     #[cfg(not(unix))]
-    #[allow(dead_code)] // consumed by ENG-1528 (coding-run adapters)
     pub fn register(&self, _request_id: &str, _child: &GroupChild) {}
 
-    #[allow(dead_code)] // consumed by ENG-1528 (coding-run adapters)
     pub fn unregister(&self, request_id: &str) {
         #[cfg(unix)]
         self.groups

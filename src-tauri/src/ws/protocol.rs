@@ -28,7 +28,6 @@ pub enum OutgoingMessage {
     /// a request that streams sends 0..n `ResponseChunk`s and ALWAYS finishes
     /// with the terminal `Response` — including when cancelled. `seq` is
     /// monotonically increasing per request so the engine can order/replay.
-    #[allow(dead_code)] // emitted by ENG-1528's streaming handlers
     ResponseChunk {
         request_id: String,
         seq: u64,
