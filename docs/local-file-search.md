@@ -49,6 +49,27 @@ Security is unchanged throughout: denied paths are pruned at build time and
 scope is re-checked at query time, so the cache can never surface a blocked
 path.
 
+### Noise exclusion (`search_filter`)
+
+Separate from the security deny-list (which blocks *sensitive* files), a
+`search_filter` list prunes build / dependency / cache **noise** so results
+aren't buried in generated files (e.g. a query for `chat-input.tsx` used to
+also surface `.next/…/components_chat_chat-input_tsx_*.js`). Because the
+agent's job is finding the user's files, recall is the priority:
+
+- **Always excluded** — unambiguous generated dirs, almost all hidden dotfiles
+  (`.next`, `.turbo`, `.svelte-kit`, `.parcel-cache`, `.pytest_cache`,
+  `.mypy_cache`, `.gradle`, `.cache`, `bower_components`, `*.egg-info`, …).
+  Near-zero collision with real content.
+- **Excluded only inside a build tree** — ambiguous generic names (`dist`,
+  `build`, `out`, `target`, `coverage`, `vendor`) are pruned only when a sibling
+  manifest (`package.json`, `Cargo.toml`, `go.mod`, …) proves it. So a user's
+  real `~/Documents/build/` stays searchable; a project's `dist/` does not.
+- **`.gitignore` is deliberately NOT a hard filter.** For a find-my-files agent
+  it routinely hides exactly what the user is looking for (a gitignored
+  `notes/`, `data/`, local config) — the opposite of the code-search tradeoff
+  ripgrep makes.
+
 ## Measured improvement
 
 Benchmark (`bench_index_vs_naive_walk`, run with
