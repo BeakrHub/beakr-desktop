@@ -279,8 +279,8 @@ pub fn get_stored_token(app: AppHandle) -> Result<Option<String>, String> {
 /// store, and flip the tray label back to "Pair device". Shared by the
 /// `clear_token` command (user-initiated "Unlink Device") and the WS client's
 /// revocation path, which must unlink authoritatively in Rust because the app
-/// runs as a menu-bar accessory with no webview alive at startup to handle the
-/// `token_invalid` event.
+/// can run with no webview alive at startup (the window opens on demand), so
+/// no frontend exists to handle the `token_invalid` event.
 pub(crate) async fn clear_device_token(app: &AppHandle, state: &AppState) -> Result<(), String> {
     // Clear runtime state
     *state.auth_token.write().await = None;
