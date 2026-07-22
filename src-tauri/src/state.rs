@@ -60,6 +60,9 @@ pub struct AppState {
     pub shutdown_requested: Arc<AtomicBool>,
     /// Notifies the WS client when scoped_folders are changed via the UI.
     pub folders_changed: Arc<tokio::sync::Notify>,
+    /// In-memory metadata cache over the scoped folders, so repeat filename
+    /// searches answer without re-walking disk (ENG-1150).
+    pub file_index: Arc<crate::file_index::FileIndex>,
     /// The captured Benchling browser session, set once the user connects and
     /// logs in. `None` until a successful connect; the live `benchling_*` tools
     /// return a reconnect error while it is `None` or after the session expires.
@@ -82,6 +85,7 @@ impl AppState {
             ws_shutdown: Arc::new(tokio::sync::Notify::new()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             folders_changed: Arc::new(tokio::sync::Notify::new()),
+            file_index: Arc::new(crate::file_index::FileIndex::new()),
             benchling_session: Arc::new(RwLock::new(None)),
         }
     }

@@ -26,7 +26,9 @@ pub async fn dispatch_request(
     }
     match tool {
         "list_files" => list_files::handle(params, scoped_folders).await,
-        "search_files" => search_files::handle(params, scoped_folders).await,
+        "search_files" => {
+            search_files::handle(params, scoped_folders, &state.file_index).await
+        }
         "read_file" => read_file::handle(params, scoped_folders).await,
         "file_info" => file_info::handle(params, scoped_folders).await,
         other => Err(format!("Unknown tool: {other}")),
