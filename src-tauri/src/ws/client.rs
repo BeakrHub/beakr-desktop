@@ -33,6 +33,18 @@ const OUTBOUND_BUFFER: usize = 256;
 
 /// WebSocket close codes from the server.
 const CLOSE_REVOKED: u16 = 4010;
+/// How many CONSECUTIVE handshake 403s before the token is treated as
+/// revoked. One 403 is NOT proof of revocation: an engine mid-restart can
+/// reject the handshake transiently, and on 2026-07-17 that destroyed a
+/// healthy pairing (ENG-1582 bug 4) — the token was cleared and the user
+/// sent back to the pairing screen while the device row was active all
+/// along. With backoff, 5 consecutive 403s span roughly a minute — far
+/// longer than any engine boot — while a genuinely revoked token still
+/// resolves terminally without user-visible flapping.
+const REVOKE_403_THRESHOLD: u32 = 5;
+/// Marker for a retryable handshake 403 (threshold not yet reached), so
+/// run() can count consecutive occurrences across reconnect attempts.
+const HANDSHAKE_403_MARKER: &str = "handshake_403_forbidden";
 const CLOSE_SESSION_EXPIRED: u16 = 4011;
 
 pub struct WsClient {
@@ -50,13 +62,16 @@ impl WsClient {
     pub async fn run(&self) {
         log::info!("WsClient starting, url={}", self.ws_url);
         let mut attempt = 0u32;
+        // Consecutive handshake-403 count (see REVOKE_403_THRESHOLD).
+        let mut consecutive_403s = 0u32;
 
         loop {
             self.set_status(ConnectionStatus::Connecting).await;
             log::debug!("Connection attempt {attempt}");
 
-            match self.connect_and_run().await {
+            match self.connect_and_run(consecutive_403s).await {
                 Ok(close_code) => {
+                    consecutive_403s = 0;
                     log::debug!("Connection closed with code: {close_code:?}");
                     if close_code == Some(CLOSE_REVOKED) {
                         log::warn!("Device revoked by server");
@@ -86,7 +101,16 @@ impl WsClient {
                     attempt = 0;
                 }
                 Err(e) => {
-                    log::error!("WebSocket error: {e}");
+                    if e.to_string().contains(HANDSHAKE_403_MARKER) {
+                        consecutive_403s = consecutive_403s.saturating_add(1);
+                        log::warn!(
+                            "Handshake 403 ({consecutive_403s}/{REVOKE_403_THRESHOLD}) — \
+                             retrying before concluding revocation"
+                        );
+                    } else {
+                        consecutive_403s = 0;
+                        log::error!("WebSocket error: {e}");
+                    }
                     attempt = attempt.saturating_add(1);
                 }
             }
@@ -130,8 +154,11 @@ impl WsClient {
     }
 
     /// Connect, register, and run the message loop. Returns the close code if any.
+    /// `consecutive_403s` is how many handshake 403s preceded this attempt —
+    /// see REVOKE_403_THRESHOLD.
     async fn connect_and_run(
         &self,
+        consecutive_403s: u32,
     ) -> Result<Option<u16>, Box<dyn std::error::Error + Send + Sync>> {
         let token = self.state.auth_token.read().await.clone();
 
@@ -149,8 +176,11 @@ impl WsClient {
                 .headers_mut()
                 .insert("User-Agent", HeaderValue::from_str(&user_agent)?);
             tokio_tungstenite::connect_async(request).await
-        } else if cfg!(debug_assertions) {
-            // Dev mode: use query params for auth (matches backend dev bypass)
+        } else if cfg!(debug_assertions) && std::env::var("BEAKR_DEV_IDENTITY").is_ok() {
+            // Dev identity is OPT-IN (ENG-1582 bug 2): auto-connecting as a
+            // hardcoded dev_local identity pre-pairing created a decoy device
+            // row that confused the device picker and online-status gate.
+            // Set BEAKR_DEV_IDENTITY=1 to use it deliberately.
             let dev_url = format!(
                 "{}?identity_id=dev_local&email=dev@localhost&identity_name=dev&display_name=Dev+User",
                 self.ws_url
@@ -167,15 +197,23 @@ impl WsClient {
         let (ws_stream, _response) = match connect_result {
             Ok(pair) => pair,
             Err(e) => {
-                // A 403 at the HTTP handshake is the engine rejecting this device
-                // token outright ("Invalid or revoked device token"). It happens
-                // *before* the WS upgrade, so it never arrives as a 4010 close
-                // frame — without this it falls through to the generic reconnect
-                // backoff and loops forever. Map it to the same terminal-revoked
-                // path as 4010: stop reconnecting, mark Revoked, emit token_invalid.
+                // A 403 at the HTTP handshake is how the engine rejects an
+                // invalid/revoked device token (pre-WS-upgrade, so never a
+                // 4010 close frame) — but it is also what a mid-restart engine
+                // can return transiently. Destroying the pairing on the FIRST
+                // 403 wiped a healthy token on 2026-07-17 (ENG-1582 bug 4).
+                // Only a run of consecutive 403s (REVOKE_403_THRESHOLD) is
+                // treated as terminal revocation; until then it retries with
+                // the normal backoff.
                 if is_revoked_handshake(&e) {
-                    log::warn!("Handshake rejected with 403 Forbidden — device token revoked");
-                    return Ok(Some(CLOSE_REVOKED));
+                    if handshake_403_is_terminal(consecutive_403s + 1) {
+                        log::warn!(
+                            "Handshake rejected with 403 Forbidden {} times — device token revoked",
+                            consecutive_403s + 1
+                        );
+                        return Ok(Some(CLOSE_REVOKED));
+                    }
+                    return Err(HANDSHAKE_403_MARKER.into());
                 }
                 return Err(e.into());
             }
@@ -535,14 +573,20 @@ async fn run_request(
     }
 }
 
-/// True when a connect error is a 403 Forbidden returned at the HTTP handshake —
-/// the engine's signal that the device token is invalid or revoked. This is
-/// distinct from a transient network failure: a 403 will never succeed on retry,
-/// so it's treated as terminal-revoked rather than backed off.
+/// True when a connect error is a 403 Forbidden returned at the HTTP
+/// handshake. Detection only — terminality is decided by
+/// `handshake_403_is_terminal` over CONSECUTIVE occurrences, because a 403
+/// can be transient (engine mid-restart), not just revocation.
 fn is_revoked_handshake(err: &tokio_tungstenite::tungstenite::Error) -> bool {
     use tokio_tungstenite::tungstenite::http::StatusCode;
     use tokio_tungstenite::tungstenite::Error;
     matches!(err, Error::Http(response) if response.status() == StatusCode::FORBIDDEN)
+}
+
+/// Whether a run of consecutive handshake 403s is long enough to conclude
+/// the token is genuinely revoked rather than the engine being mid-restart.
+fn handshake_403_is_terminal(consecutive_403s: u32) -> bool {
+    consecutive_403s >= REVOKE_403_THRESHOLD
 }
 
 /// Whether the WebSocket link should be considered dead, given how long it has
@@ -601,11 +645,21 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_handshake_is_terminal_revoked() {
-        // Regression: the engine rejects a revoked/invalid device token with a
-        // 403 at the HTTP handshake (pre-WS-upgrade, so never a 4010 close).
-        // It must be classified terminal so run() stops instead of looping forever.
+    fn forbidden_handshake_is_detected() {
+        // Detection only: terminality now requires a run of consecutive 403s.
         assert!(is_revoked_handshake(&http_error(StatusCode::FORBIDDEN)));
+    }
+
+    #[test]
+    fn single_handshake_403_is_not_terminal_revocation() {
+        // Regression (ENG-1582 bug 4, live 2026-07-17): an engine mid-restart
+        // returned one transient 403 and the client destroyed the pairing
+        // token of a healthy, active device. A lone 403 must retry.
+        assert!(!handshake_403_is_terminal(1));
+        assert!(!handshake_403_is_terminal(REVOKE_403_THRESHOLD - 1));
+        // A sustained run of 403s IS revocation — the app must not flap forever.
+        assert!(handshake_403_is_terminal(REVOKE_403_THRESHOLD));
+        assert!(handshake_403_is_terminal(REVOKE_403_THRESHOLD + 3));
     }
 
     #[test]
