@@ -2,6 +2,7 @@ mod benchling;
 mod file_info;
 mod list_files;
 mod read_file;
+mod reveal_file;
 mod search_files;
 
 use serde_json::Value;
@@ -31,6 +32,7 @@ pub async fn dispatch_request(
         }
         "read_file" => read_file::handle(params, scoped_folders, &state.file_index).await,
         "file_info" => file_info::handle(params, scoped_folders).await,
+        "reveal_file" => reveal_file::handle(params, scoped_folders).await,
         other => Err(format!("Unknown tool: {other}")),
     }
 }
