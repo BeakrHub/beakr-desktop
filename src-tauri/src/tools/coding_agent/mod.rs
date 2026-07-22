@@ -17,7 +17,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::process_group::GroupChild;
-use crate::state::AppState;
+use crate::state::{ActiveCodingRun, AppState, CodingRunStatus};
 use crate::ws::inflight::CancelSignal;
 use crate::ws::ToolStream;
 use runner::{Chunk, LocalCodingRunner, ParsedLine, RunResult, RunSpec};
@@ -93,6 +93,7 @@ pub async fn handle_streaming(
 
     let binary = binary::resolve(runner.name(), settings.claude_binary_path.as_deref())?;
 
+    let working_dir_display = working_dir.to_string_lossy().into_owned();
     let spec = RunSpec {
         prompt: params.prompt,
         working_dir,
@@ -108,7 +109,21 @@ pub async fn handle_streaming(
     let mut child = GroupChild::spawn(&mut cmd)
         .map_err(|e| format!("spawn_failed: could not start {}: {e}", runner.name()))?;
     state.processes.register(stream.request_id(), &child);
-    set_run_ui(app, state, Some(stream.request_id())).await;
+    set_run_ui(
+        app,
+        state,
+        Some(ActiveCodingRun {
+            request_id: stream.request_id().to_string(),
+            working_dir: working_dir_display,
+            cli: runner.name().to_string(),
+            started_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            status: CodingRunStatus::Running,
+        }),
+    )
+    .await;
 
     let stdout = child
         .stdout_take()
@@ -181,6 +196,10 @@ pub async fn handle_streaming(
             _ = cancel.cancelled(), if !cancelled => {
                 cancelled = true;
                 log::info!("Cancel received for {} — SIGINT to the group", stream.request_id());
+                // Truth-telling (ENG-1552): the child has been signalled but
+                // is NOT confirmed dead. The tray/window show "Stopping…"
+                // until cleanup() clears the run after the process is reaped.
+                mark_run_stopping(app, state).await;
                 child.interrupt();
                 // Give the CLI CANCEL_GRACE to exit cleanly (session stays
                 // resumable), then escalate. The loop keeps draining stdout
@@ -245,18 +264,45 @@ pub async fn handle_streaming(
     }
 }
 
-/// Reflect run start/stop in the tray + frontend, and keep the active-run id
-/// where the tray "Stop run" handler can reach it.
-async fn set_run_ui(app: &AppHandle, state: &AppState, request_id: Option<&str>) {
+/// Reflect run start/stop in the tray + frontend, and keep the active run
+/// where the tray "Stop run" handler and the app window can reach it.
+async fn set_run_ui(app: &AppHandle, state: &AppState, run: Option<ActiveCodingRun>) {
     *state
         .active_coding_run
         .write()
-        .expect("active run lock poisoned") = request_id.map(String::from);
-    crate::tray::update_tray_coding_run(app, request_id.is_some());
+        .expect("active run lock poisoned") = run.clone();
+    crate::tray::update_tray_coding_run(app, run.as_ref());
+    // `active` is kept for compatibility with the original event shape; `run`
+    // is the full payload the ActiveRunCard renders (null when no run).
     let _ = app.emit(
         "coding_run:changed",
-        serde_json::json!({ "active": request_id.is_some() }),
+        serde_json::json!({ "active": run.is_some(), "run": run }),
     );
+}
+
+/// Move the active run to Stopping without touching its identity fields.
+/// No-op if the run has already been cleared (cancel racing a natural exit).
+async fn mark_run_stopping(app: &AppHandle, state: &AppState) {
+    let stopping = {
+        let mut guard = state
+            .active_coding_run
+            .write()
+            .expect("active run lock poisoned");
+        match guard.as_mut() {
+            Some(run) => {
+                run.status = CodingRunStatus::Stopping;
+                Some(run.clone())
+            }
+            None => None,
+        }
+    };
+    if let Some(run) = stopping {
+        crate::tray::update_tray_coding_run(app, Some(&run));
+        let _ = app.emit(
+            "coding_run:changed",
+            serde_json::json!({ "active": true, "run": run }),
+        );
+    }
 }
 
 async fn cleanup(app: &AppHandle, state: &AppState, request_id: &str) {

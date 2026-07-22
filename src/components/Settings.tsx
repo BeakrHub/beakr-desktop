@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import BeakrLogo from "./BeakrLogo";
 import ConnectionStatus from "./ConnectionStatus";
+import ActiveRunCard from "./ActiveRunCard";
 import ActivityFeed from "./ActivityFeed";
 import FolderPicker from "./FolderPicker";
 import CodingAgentSettings from "./CodingAgentSettings";
@@ -76,6 +77,8 @@ export default function Settings({ onUnlink }: SettingsProps) {
       <UpdateBanner updater={updater} />
 
       <ConnectionStatus />
+
+      <ActiveRunCard />
 
       <ActivityFeed />
 
