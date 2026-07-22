@@ -20,7 +20,7 @@ use crate::process_group::GroupChild;
 use crate::state::AppState;
 use crate::ws::inflight::CancelSignal;
 use crate::ws::ToolStream;
-use runner::{LocalCodingRunner, ParsedLine, RunResult, RunSpec};
+use runner::{Chunk, LocalCodingRunner, ParsedLine, RunResult, RunSpec};
 
 /// Hard ceiling on a single run. Long enough for a real coding task, short
 /// enough that a wedged CLI can't hold the coding slot forever.
@@ -145,7 +145,26 @@ pub async fn handle_streaming(
                             let data = serde_json::to_value(&chunk).unwrap_or_default();
                             stream.chunk(data).await;
                         }
+                        ParsedLine::Chunks(chunks) => {
+                            for chunk in &chunks {
+                                let data = serde_json::to_value(chunk).unwrap_or_default();
+                                stream.chunk(data).await;
+                            }
+                        }
                         ParsedLine::Final(result) => {
+                            // Surface the run's cost through the normal chunk
+                            // stream too (ENG-1552): the engine's accumulator
+                            // folds it into every subsequent card emit. The CLI
+                            // only reports cost here, on its terminal event —
+                            // there are no mid-run ticks to forward.
+                            if let Some(cost) = result.total_cost_usd {
+                                let data = serde_json::to_value(Chunk {
+                                    total_cost_usd: Some(cost),
+                                    ..Chunk::bare("cost")
+                                })
+                                .unwrap_or_default();
+                                stream.chunk(data).await;
+                            }
                             final_result = Some(result);
                             // Keep draining until EOF: the process exit code
                             // and any trailing events still matter.

@@ -25,12 +25,41 @@ pub struct RunSpec {
 /// `response_chunk.data`. Kept deliberately small and additive.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Chunk {
-    /// "session" | "text" | "tool" | "status"
+    /// "session" | "text" | "tool" | "file_changed" | "cost" | "status"
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Target file for "tool" (when the tool has one) and "file_changed".
+    /// The live-run card's files-changed list and activity line read this
+    /// (ENG-1552) — a bare tool name tells the user nothing they can audit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// For "file_changed": "write" (file created/replaced) | "modify" (edited).
+    /// No "delete" until Bash lands — the write-capable tool surface can't rm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change: Option<&'static str>,
+    /// For "cost": the run's total cost so far in USD. `claude -p` only
+    /// reports cost on its terminal result event, so today this arrives once
+    /// at the end of the run rather than as live ticks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+}
+
+impl Chunk {
+    /// A chunk of `kind` with every optional field unset — construction sites
+    /// spread onto this so adding a field never touches them again.
+    pub fn bare(kind: &'static str) -> Self {
+        Chunk {
+            kind,
+            text: None,
+            session_id: None,
+            path: None,
+            change: None,
+            total_cost_usd: None,
+        }
+    }
 }
 
 /// Terminal result of a run, embedded in the terminal `response.data`.
@@ -51,6 +80,9 @@ pub struct RunResult {
 pub enum ParsedLine {
     /// Forward this chunk to the engine.
     Chunk(Chunk),
+    /// Forward several chunks, in order (one assistant message can carry
+    /// multiple tool calls, and an Edit/Write yields tool + file_changed).
+    Chunks(Vec<Chunk>),
     /// The run's terminal payload (the CLI's own "result" event). The process
     /// may still take a moment to exit; the orchestrator keeps draining.
     Final(RunResult),

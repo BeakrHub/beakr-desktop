@@ -39,6 +39,50 @@ const ALLOWED_TOOLS: &str = "Read,Glob,Grep,Edit,Write";
 /// WebFetch/WebSearch denied because CC has no default network sandbox.
 const DISALLOWED_TOOLS: &str = "Bash,WebFetch,WebSearch";
 
+/// Normalize one tool_use into chunks: a "tool" activity marker carrying the
+/// target path when the tool has one, plus a "file_changed" for write-capable
+/// tools (ENG-1552). Derived from tool INPUTS, per DESIGN.md's observability
+/// spec — under `acceptEdits` an emitted Edit/Write is applied, not proposed,
+/// so the input path is the changed file.
+fn tool_use_chunks(name: &str, input: &serde_json::Value) -> Vec<Chunk> {
+    let file_path = input["file_path"].as_str().or_else(|| input["path"].as_str());
+    let pattern = input["pattern"].as_str();
+
+    // Human-readable activity line: "Edit seed_sweep.py", "Grep TODO", "Read".
+    // Basename only — the full path is in `path` for anything that needs it.
+    let label = if let Some(p) = file_path {
+        format!("{name} {}", basename(p))
+    } else if let Some(pat) = pattern {
+        format!("{name} {pat}")
+    } else {
+        name.to_string()
+    };
+
+    let mut chunks = vec![Chunk {
+        text: Some(label),
+        path: file_path.map(String::from),
+        ..Chunk::bare("tool")
+    }];
+
+    let change = match name {
+        "Write" => Some("write"),
+        "Edit" | "MultiEdit" | "NotebookEdit" => Some("modify"),
+        _ => None,
+    };
+    if let (Some(change), Some(p)) = (change, file_path) {
+        chunks.push(Chunk {
+            path: Some(p.to_string()),
+            change: Some(change),
+            ..Chunk::bare("file_changed")
+        });
+    }
+    chunks
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 impl LocalCodingRunner for ClaudeRunner {
     fn name(&self) -> &'static str {
         "claude"
@@ -85,16 +129,14 @@ impl LocalCodingRunner for ClaudeRunner {
             Some("system") => match v["subtype"].as_str() {
                 Some("init") => match v["session_id"].as_str() {
                     Some(sid) => ParsedLine::Chunk(Chunk {
-                        kind: "session",
-                        text: None,
                         session_id: Some(sid.to_string()),
+                        ..Chunk::bare("session")
                     }),
                     None => ParsedLine::Ignore,
                 },
                 Some("api_retry") => ParsedLine::Chunk(Chunk {
-                    kind: "status",
                     text: Some("retrying after an API error".to_string()),
-                    session_id: None,
+                    ..Chunk::bare("status")
                 }),
                 _ => ParsedLine::Ignore,
             },
@@ -104,9 +146,8 @@ impl LocalCodingRunner for ClaudeRunner {
                 if delta["type"].as_str() == Some("text_delta") {
                     match delta["text"].as_str() {
                         Some(t) if !t.is_empty() => ParsedLine::Chunk(Chunk {
-                            kind: "text",
                             text: Some(t.to_string()),
-                            session_id: None,
+                            ..Chunk::bare("text")
                         }),
                         _ => ParsedLine::Ignore,
                     }
@@ -114,27 +155,25 @@ impl LocalCodingRunner for ClaudeRunner {
                     ParsedLine::Ignore
                 }
             }
-            // Whole assistant messages: forward tool_use as activity markers.
-            // Text content is already covered by the deltas above.
+            // Whole assistant messages: forward each tool_use as a structured
+            // activity marker (ENG-1552). Collapsing to bare tool names threw
+            // away the target paths — exactly the structure the live-run card's
+            // activity line and files-changed list need. Text content is
+            // already covered by the deltas above.
             Some("assistant") => {
-                let tools: Vec<&str> = v["message"]["content"]
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter(|i| i["type"].as_str() == Some("tool_use"))
-                            .filter_map(|i| i["name"].as_str())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if tools.is_empty() {
-                    ParsedLine::Ignore
-                } else {
-                    ParsedLine::Chunk(Chunk {
-                        kind: "tool",
-                        text: Some(tools.join(", ")),
-                        session_id: None,
-                    })
+                let mut chunks: Vec<Chunk> = Vec::new();
+                if let Some(items) = v["message"]["content"].as_array() {
+                    for item in items.iter().filter(|i| i["type"].as_str() == Some("tool_use")) {
+                        let Some(name) = item["name"].as_str() else {
+                            continue;
+                        };
+                        chunks.extend(tool_use_chunks(name, &item["input"]));
+                    }
+                }
+                match chunks.len() {
+                    0 => ParsedLine::Ignore,
+                    1 => ParsedLine::Chunk(chunks.pop().expect("len checked")),
+                    _ => ParsedLine::Chunks(chunks),
                 }
             }
             Some("result") => ParsedLine::Final(RunResult {
@@ -188,9 +227,8 @@ mod tests {
         assert_eq!(
             parse(line),
             ParsedLine::Chunk(Chunk {
-                kind: "session",
-                text: None,
                 session_id: Some("abc-123".into()),
+                ..Chunk::bare("session")
             })
         );
     }
@@ -201,22 +239,72 @@ mod tests {
         assert_eq!(
             parse(line),
             ParsedLine::Chunk(Chunk {
-                kind: "text",
                 text: Some("Fixing the test".into()),
-                session_id: None,
+                ..Chunk::bare("text")
             })
         );
     }
 
     #[test]
-    fn assistant_tool_use_yields_tool_chunk() {
+    fn assistant_tool_uses_yield_one_chunk_each_with_names() {
+        // ENG-1552: no more "Edit, Read" collapsing — one tool chunk per call.
+        // Inputs without paths degrade to name-only labels.
         let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me look."},{"type":"tool_use","name":"Edit","input":{}},{"type":"tool_use","name":"Read","input":{}}]}}"#;
         assert_eq!(
             parse(line),
+            ParsedLine::Chunks(vec![
+                Chunk { text: Some("Edit".into()), ..Chunk::bare("tool") },
+                Chunk { text: Some("Read".into()), ..Chunk::bare("tool") },
+            ])
+        );
+    }
+
+    #[test]
+    fn edit_with_file_path_yields_tool_and_file_changed() {
+        // ENG-1552: the trust surface — an applied edit reports its target.
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/src/app.py","old_string":"a","new_string":"b"}}]}}"#;
+        assert_eq!(
+            parse(line),
+            ParsedLine::Chunks(vec![
+                Chunk {
+                    text: Some("Edit app.py".into()),
+                    path: Some("/repo/src/app.py".into()),
+                    ..Chunk::bare("tool")
+                },
+                Chunk {
+                    path: Some("/repo/src/app.py".into()),
+                    change: Some("modify"),
+                    ..Chunk::bare("file_changed")
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn write_yields_file_changed_write_and_read_does_not() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"/repo/new.md","content":"x"}},{"type":"tool_use","name":"Read","input":{"file_path":"/repo/old.md"}}]}}"#;
+        let ParsedLine::Chunks(chunks) = parse(line) else {
+            panic!("expected Chunks");
+        };
+        let file_changed: Vec<_> =
+            chunks.iter().filter(|c| c.kind == "file_changed").collect();
+        assert_eq!(file_changed.len(), 1, "Read must not emit file_changed");
+        assert_eq!(file_changed[0].path.as_deref(), Some("/repo/new.md"));
+        assert_eq!(file_changed[0].change, Some("write"));
+        // Read still surfaces as an activity marker with its target.
+        assert!(chunks
+            .iter()
+            .any(|c| c.kind == "tool" && c.text.as_deref() == Some("Read old.md")));
+    }
+
+    #[test]
+    fn grep_pattern_lands_in_label_not_path() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Grep","input":{"pattern":"TODO"}}]}}"#;
+        assert_eq!(
+            parse(line),
             ParsedLine::Chunk(Chunk {
-                kind: "tool",
-                text: Some("Edit, Read".into()),
-                session_id: None,
+                text: Some("Grep TODO".into()),
+                ..Chunk::bare("tool")
             })
         );
     }
@@ -329,9 +417,8 @@ mod tests {
         assert_eq!(
             parse(init),
             ParsedLine::Chunk(Chunk {
-                kind: "session",
-                text: None,
                 session_id: Some("1853c519-9b0b-4c79-bd97-697f476c516a".into()),
+                ..Chunk::bare("session")
             })
         );
 
