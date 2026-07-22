@@ -53,6 +53,14 @@ pub struct Chunk {
     /// `command`); Claude never emits it while Bash stays denied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// For "session": which CLI is actually running (ENG-1581 — the run card
+    /// names its runner; the engine can't know when the device resolved a
+    /// default) and, when the CLI reports one, the model it is using (Claude
+    /// announces it on init; Codex does not expose one in its stream).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Chunk {
@@ -67,6 +75,8 @@ impl Chunk {
             change: None,
             total_cost_usd: None,
             command: None,
+            cli: None,
+            model: None,
         }
     }
 }
