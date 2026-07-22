@@ -4,7 +4,7 @@ use tauri::{
     AppHandle, Manager,
 };
 
-use crate::state::ConnectionStatus;
+use crate::state::{ActiveCodingRun, CodingRunStatus, ConnectionStatus};
 
 const WINDOW_LABEL: &str = "settings";
 const WINDOW_TITLE: &str = "Beakr Desktop";
@@ -65,17 +65,8 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             }
             "stop_run" => {
                 if let Some(state) = app.try_state::<crate::state::AppState>() {
-                    let active = state
-                        .active_coding_run
-                        .read()
-                        .expect("active run lock poisoned")
-                        .clone();
-                    match active {
-                        Some(request_id) => {
-                            log::info!("Tray stop: cancelling coding run {request_id}");
-                            state.inflight.cancel(&request_id);
-                        }
-                        None => log::debug!("Tray stop clicked with no active run"),
+                    if crate::state::stop_active_coding_run(&state).is_none() {
+                        log::debug!("Tray stop clicked with no active run");
                     }
                 }
             }
@@ -155,9 +146,74 @@ pub fn update_tray_pairing(app: &AppHandle, is_paired: bool) {
     }
 }
 
-/// Enable/disable the "Stop coding run" item as runs start/finish (ENG-1528).
-pub fn update_tray_coding_run(app: &AppHandle, active: bool) {
+/// The stop item's (label, enabled) for a run state. Pure so it's testable:
+/// the label says WHAT would be stopped (folder basename), and the item is
+/// disabled while Stopping — the cancel is already signalled, a second click
+/// can do nothing, and the label must not pretend the run is gone before the
+/// child is confirmed dead (ENG-1552 run visibility).
+fn stop_item_appearance(run: Option<&ActiveCodingRun>) -> (String, bool) {
+    match run {
+        None => ("Stop coding run".to_string(), false),
+        Some(run) => match run.status {
+            CodingRunStatus::Running => {
+                let folder = std::path::Path::new(&run.working_dir)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| run.working_dir.clone());
+                (format!("Stop coding run in {folder}"), true)
+            }
+            CodingRunStatus::Stopping => ("Stopping coding run…".to_string(), false),
+        },
+    }
+}
+
+/// Reflect the active coding run on the tray as runs start/stop/finish
+/// (ENG-1528, enriched for ENG-1552 run visibility).
+pub fn update_tray_coding_run(app: &AppHandle, run: Option<&ActiveCodingRun>) {
+    let (label, enabled) = stop_item_appearance(run);
     if let Some(tray_state) = app.try_state::<TrayState>() {
-        let _ = tray_state.stop_run_item.set_enabled(active);
+        let _ = tray_state.stop_run_item.set_text(&label);
+        let _ = tray_state.stop_run_item.set_enabled(enabled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(status: CodingRunStatus) -> ActiveCodingRun {
+        ActiveCodingRun {
+            request_id: "req-1".into(),
+            working_dir: "/Users/d/wandb-sandbox".into(),
+            cli: "claude".into(),
+            started_at_ms: 0,
+            status,
+        }
+    }
+
+    #[test]
+    fn idle_item_is_generic_and_disabled() {
+        assert_eq!(
+            stop_item_appearance(None),
+            ("Stop coding run".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn running_item_names_the_folder_and_enables() {
+        assert_eq!(
+            stop_item_appearance(Some(&run(CodingRunStatus::Running))),
+            ("Stop coding run in wandb-sandbox".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn stopping_item_says_stopping_and_disables() {
+        // The child was SIGINTed but is not confirmed dead — a second click is
+        // useless and the label must not claim the run already stopped.
+        assert_eq!(
+            stop_item_appearance(Some(&run(CodingRunStatus::Stopping))),
+            ("Stopping coding run…".to_string(), false)
+        );
     }
 }

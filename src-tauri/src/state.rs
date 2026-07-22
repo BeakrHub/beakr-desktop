@@ -42,6 +42,36 @@ impl std::fmt::Display for ConnectionStatus {
     }
 }
 
+/// Lifecycle of the one active coding run, as shown to the user (ENG-1552).
+///
+/// `Stopping` is the truth-telling state: a cancel has been signalled (tray,
+/// app window, or engine WS) and the child has been SIGINTed, but the process
+/// is NOT yet confirmed dead. The UI must keep saying "Stopping…" until the
+/// run is reaped and cleared — never claim a run is gone while it may still
+/// be editing files.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingRunStatus {
+    Running,
+    Stopping,
+}
+
+/// The active coding run, if any — what the tray and app window render.
+/// Serialized as the `coding_run:changed` event payload and the
+/// `get_active_coding_run` response, so field names are a frontend contract.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ActiveCodingRun {
+    pub request_id: String,
+    /// Canonicalized cwd of the run. The UI shows the basename, full path on
+    /// hover — same convention as the web card.
+    pub working_dir: String,
+    pub cli: String,
+    /// Unix epoch millis when the child spawned; the frontend derives elapsed
+    /// from this instead of the backend streaming ticks.
+    pub started_at_ms: u64,
+    pub status: CodingRunStatus,
+}
+
 /// Shared application state, accessible from commands and the WS client.
 #[derive(Clone)]
 pub struct AppState {
@@ -82,9 +112,73 @@ pub struct AppState {
     pub inflight: Arc<crate::ws::inflight::InflightRegistry>,
     /// Live child process groups, reaped on quit (ENG-1527).
     pub processes: Arc<crate::process_group::ProcessRegistry>,
-    /// request_id of the coding run in progress, if any (ENG-1528). std
-    /// RwLock on purpose: the tray "Stop run" handler is synchronous.
-    pub active_coding_run: Arc<std::sync::RwLock<Option<String>>>,
+    /// The coding run in progress, if any (ENG-1528; enriched for ENG-1552
+    /// run visibility). std RwLock on purpose: the tray "Stop run" handler is
+    /// synchronous.
+    pub active_coding_run: Arc<std::sync::RwLock<Option<ActiveCodingRun>>>,
+}
+
+/// Signal cancellation of the active coding run, from the tray or the app
+/// window. Returns the request_id it cancelled, or None if no run was active.
+/// The run's own loop observes the signal, SIGINTs the child, and moves the
+/// UI state to Stopping — this function only fires the signal.
+pub fn stop_active_coding_run(state: &AppState) -> Option<String> {
+    let active = state
+        .active_coding_run
+        .read()
+        .expect("active run lock poisoned")
+        .as_ref()
+        .map(|run| run.request_id.clone());
+    if let Some(request_id) = &active {
+        log::info!("Local stop: cancelling coding run {request_id}");
+        state.inflight.cancel(request_id);
+    }
+    active
+}
+
+#[cfg(test)]
+mod coding_run_tests {
+    use super::*;
+
+    // The serialized shape is the frontend contract for the
+    // `coding_run:changed` event and `get_active_coding_run` — pin it.
+    #[test]
+    fn active_run_serializes_with_snake_case_status() {
+        let run = ActiveCodingRun {
+            request_id: "req-1".into(),
+            working_dir: "/Users/d/repo".into(),
+            cli: "claude".into(),
+            started_at_ms: 1_700_000_000_000,
+            status: CodingRunStatus::Stopping,
+        };
+        let v = serde_json::to_value(&run).unwrap();
+        assert_eq!(v["status"], "stopping");
+        assert_eq!(v["working_dir"], "/Users/d/repo");
+        assert_eq!(v["started_at_ms"], 1_700_000_000_000u64);
+    }
+
+    #[test]
+    fn stop_with_no_active_run_is_a_noop() {
+        let state = AppState::new();
+        assert_eq!(stop_active_coding_run(&state), None);
+    }
+
+    #[test]
+    fn stop_cancels_the_active_run_by_request_id() {
+        let state = AppState::new();
+        let signal = state.inflight.register("req-9");
+        *state.active_coding_run.write().unwrap() = Some(ActiveCodingRun {
+            request_id: "req-9".into(),
+            working_dir: "/tmp".into(),
+            cli: "claude".into(),
+            started_at_ms: 0,
+            status: CodingRunStatus::Running,
+        });
+
+        assert_eq!(stop_active_coding_run(&state), Some("req-9".into()));
+        // The registered cancel signal must have fired.
+        assert!(signal.is_cancelled());
+    }
 }
 
 impl AppState {
