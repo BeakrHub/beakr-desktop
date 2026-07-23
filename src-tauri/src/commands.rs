@@ -96,6 +96,9 @@ pub async fn set_scoped_folders(
         scoped_folders: folders.clone(),
         device_name: Some(state.device_name.read().await.clone()),
         auto_connect: true,
+        // None here leaves the stored values untouched (save_settings only
+        // writes Some fields).
+        ..config::Settings::default()
     };
     config::save_settings(&app, &settings);
 
@@ -150,6 +153,7 @@ pub async fn set_device_name(
         scoped_folders: state.scoped_folders.read().await.clone(),
         device_name: Some(name),
         auto_connect: true,
+        ..config::Settings::default()
     };
     config::save_settings(&app, &settings);
 
@@ -326,4 +330,34 @@ fn http_client() -> reqwest::Client {
         .user_agent(format!("BeakrDesktop/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("failed to build HTTP client")
+}
+
+/// Coding-agent settings surface for the webview (ENG-1528). The API key is
+/// WRITE-ONLY: the webview learns whether one is set, never its value.
+#[tauri::command]
+pub async fn get_coding_agent_settings(app: AppHandle) -> Result<serde_json::Value, String> {
+    let settings = config::load_settings(&app);
+    Ok(serde_json::json!({
+        "has_api_key": settings.anthropic_api_key.map(|k| !k.is_empty()).unwrap_or(false),
+        "claude_binary_path": settings.claude_binary_path,
+    }))
+}
+
+/// Update coding-agent settings. `None` leaves a field unchanged; an empty
+/// string clears it.
+#[tauri::command]
+pub async fn set_coding_agent_settings(
+    app: AppHandle,
+    api_key: Option<String>,
+    claude_binary_path: Option<String>,
+) -> Result<(), String> {
+    let mut settings = config::load_settings(&app);
+    if let Some(key) = api_key {
+        settings.anthropic_api_key = Some(key);
+    }
+    if let Some(path) = claude_binary_path {
+        settings.claude_binary_path = Some(path);
+    }
+    config::save_settings(&app, &settings);
+    Ok(())
 }

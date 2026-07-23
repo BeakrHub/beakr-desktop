@@ -45,8 +45,6 @@ impl CancelSignal {
 }
 
 /// Guard for the single concurrent coding-run slot. Dropping it frees the slot.
-// Constructed by ENG-1528's run_coding_agent handler; the allow comes off then.
-#[allow(dead_code)]
 pub struct CodingRunGuard {
     _permit: OwnedSemaphorePermit,
 }
@@ -57,7 +55,6 @@ pub struct InflightRegistry {
     /// One coding run at a time per device: local CLIs are heavyweight (model
     /// inference, file edits in a workspace) and concurrent runs in the same
     /// scoped folders could interleave edits.
-    #[allow(dead_code)] // read by try_begin_coding_run, live from ENG-1528
     coding_slot: Arc<Semaphore>,
 }
 
@@ -123,7 +120,6 @@ impl InflightRegistry {
     /// is already active — the caller must fail the request (the engine
     /// surfaces "a coding run is already in progress on this device") rather
     /// than queue it behind an arbitrarily long run.
-    #[allow(dead_code)] // consumed by ENG-1528 (coding-run adapters)
     pub fn try_begin_coding_run(&self) -> Option<CodingRunGuard> {
         match Arc::clone(&self.coding_slot).try_acquire_owned() {
             Ok(permit) => Some(CodingRunGuard { _permit: permit }),

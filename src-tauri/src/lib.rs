@@ -197,6 +197,8 @@ pub fn run() {
             commands::get_stored_token,
             commands::clear_token,
             commands::get_ws_url,
+            commands::get_coding_agent_settings,
+            commands::set_coding_agent_settings,
             session::commands::connect_session,
             session::commands::benchling_status,
         ])
