@@ -54,6 +54,11 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 show_settings_window(app);
             }
             "quit" => {
+                // Reap any live coding-run process groups before exiting so
+                // CLI children aren't orphaned to PID 1 (ENG-1527).
+                if let Some(state) = app.try_state::<crate::state::AppState>() {
+                    state.processes.kill_all();
+                }
                 app.exit(0);
             }
             _ => {}
