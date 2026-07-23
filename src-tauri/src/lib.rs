@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod file_index;
 mod file_watch;
+mod search_filter;
 mod security;
 mod session;
 mod state;
