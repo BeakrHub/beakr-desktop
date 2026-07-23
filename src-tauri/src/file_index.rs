@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
@@ -53,6 +54,10 @@ pub struct FileIndex {
     /// How many times each path has been read via the `read_file` tool. A
     /// frecency signal that boosts files the agent keeps returning to.
     access: Mutex<HashMap<PathBuf, u32>>,
+    /// Set when the on-disk trees may have changed since the last refresh (by
+    /// the filesystem watcher or the periodic fallback). `ensure_fresh` only
+    /// re-walks when this is set, so most searches skip the walk entirely.
+    dirty: AtomicBool,
 }
 
 impl Default for FileIndex {
@@ -66,12 +71,28 @@ impl FileIndex {
         Self {
             state: RwLock::new(IndexState::default()),
             access: Mutex::new(HashMap::new()),
+            dirty: AtomicBool::new(true), // first search builds the index
         }
     }
 
     /// Record that `path` was read, boosting its future ranking (frecency).
     pub fn record_access(&self, path: &Path) {
         *self.access.lock().unwrap().entry(path.to_path_buf()).or_insert(0) += 1;
+    }
+
+    /// Flag that the scoped trees may have changed; the next `ensure_fresh`
+    /// will re-walk. Called by the filesystem watcher and the periodic fallback.
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Refresh the index only if it has been marked dirty since the last walk.
+    /// A file change between the flag-clear and the walk simply re-sets the
+    /// flag, so the following search reconciles it — no update is lost.
+    pub fn ensure_fresh(&self, roots: &[String]) {
+        if self.dirty.swap(false, Ordering::AcqRel) {
+            self.refresh(roots);
+        }
     }
 
     /// Refresh the index for `roots`, reusing unchanged directories.
@@ -378,6 +399,26 @@ mod tests {
         index.record_access(&b);
         let hits = index.search_names("config", None, None, 20);
         assert_eq!(hits[0].path, b, "the read file should rank first");
+    }
+
+    #[test]
+    fn ensure_fresh_only_rewalks_when_dirty() {
+        let tree = TempTree::new("dirty");
+        tree.write("first.txt", "x");
+        let index = FileIndex::new(); // starts dirty
+        index.ensure_fresh(&tree.scoped());
+        assert_eq!(index.search_names("first", None, None, 20).len(), 1);
+
+        // Change on disk but do NOT mark dirty: ensure_fresh is a no-op, so the
+        // new file is not yet visible.
+        tree.write("second.txt", "x");
+        index.ensure_fresh(&tree.scoped());
+        assert_eq!(index.search_names("second", None, None, 20).len(), 0);
+
+        // Marking dirty (what the watcher / fallback do) triggers the rescan.
+        index.mark_dirty();
+        index.ensure_fresh(&tree.scoped());
+        assert_eq!(index.search_names("second", None, None, 20).len(), 1);
     }
 
     #[test]

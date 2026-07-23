@@ -50,7 +50,7 @@ pub async fn handle(
     // repeat queries. The index prunes denied dirs/files at build time and is
     // refreshed incrementally (unchanged directories are reused).
     if !search_content {
-        index.refresh(scoped_folders);
+        index.ensure_fresh(scoped_folders);
         let root_filter = path_param.map(PathBuf::from);
         let hits = index.search_names(
             query,

@@ -58,8 +58,17 @@ pub struct AppState {
     /// Cleared on the next connect. Distinguishes a deliberate disconnect (stay
     /// down) from a dropped socket (auto-reconnect).
     pub shutdown_requested: Arc<AtomicBool>,
-    /// Notifies the WS client when scoped_folders are changed via the UI.
+    /// Notifies the WS client when scoped_folders are changed via the UI, so
+    /// it pushes the new list to the backend. The WS client must be the only
+    /// waiter on this channel — see `notify_folders_changed`.
     pub folders_changed: Arc<tokio::sync::Notify>,
+    /// The same scoped-folders-changed signal for the filesystem watcher
+    /// (file_watch.rs), which must rebind to the new roots. A separate channel
+    /// because `Notify::notify_one` wakes a single waiter: with the watcher and
+    /// the WS client parked on one Notify, a folder change woke only one of
+    /// them and the other silently missed it — the backend kept a stale
+    /// scoped_folders list (ENG-1624).
+    pub watch_folders_changed: Arc<tokio::sync::Notify>,
     /// In-memory metadata cache over the scoped folders, so repeat filename
     /// searches answer without re-walking disk (ENG-1150).
     pub file_index: Arc<crate::file_index::FileIndex>,
@@ -85,8 +94,41 @@ impl AppState {
             ws_shutdown: Arc::new(tokio::sync::Notify::new()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             folders_changed: Arc::new(tokio::sync::Notify::new()),
+            watch_folders_changed: Arc::new(tokio::sync::Notify::new()),
             file_index: Arc::new(crate::file_index::FileIndex::new()),
             benchling_session: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Signal every consumer of a scoped-folders change: the WS client (which
+    /// pushes the new list to the backend) and the filesystem watcher (which
+    /// rebinds to the new roots). Always use this instead of notifying one
+    /// channel directly, so a new consumer can't be starved by an existing one.
+    pub fn notify_folders_changed(&self) {
+        self.folders_changed.notify_one();
+        self.watch_folders_changed.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Regression (ENG-1624): one folder-change signal must reach BOTH the WS
+    /// client and the filesystem watcher. With a single shared Notify and
+    /// notify_one(), the two waiters raced and the loser silently missed the
+    /// change, leaving the backend with a stale scoped_folders list.
+    #[tokio::test]
+    async fn folder_change_signals_both_ws_and_watcher() {
+        let state = AppState::new();
+        state.notify_folders_changed();
+
+        tokio::time::timeout(Duration::from_secs(1), state.folders_changed.notified())
+            .await
+            .expect("WS channel missed the folder change");
+        tokio::time::timeout(Duration::from_secs(1), state.watch_folders_changed.notified())
+            .await
+            .expect("watcher channel missed the folder change");
     }
 }
