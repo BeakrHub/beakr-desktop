@@ -242,6 +242,27 @@ pub async fn claim_pairing_code(
     // Device is now paired — reflect that in the tray menu label.
     crate::tray::update_tray_pairing(&app, true);
 
+    // Connect NOW (ENG-1582 bug 1): the token was stored but nothing kicked
+    // the WS, so a freshly paired device showed Offline until an app restart.
+    // Same spawn/dedup logic as connect_ws.
+    {
+        let current = state.ws_status.read().await.clone();
+        if !matches!(
+            current,
+            ConnectionStatus::Connected
+                | ConnectionStatus::Connecting
+                | ConnectionStatus::Reconnecting
+        ) {
+            state.shutdown_requested.store(false, Ordering::SeqCst);
+            let state_clone = (*state).clone();
+            let app_clone = app.clone();
+            let ws_url = crate::ws_url();
+            tauri::async_runtime::spawn(async move {
+                WsClient::new(app_clone, state_clone, ws_url).run().await;
+            });
+        }
+    }
+
     crate::session::benchling::register_current_session_with_backend(&app, &state).await;
 
     // NOTE: we deliberately do NOT force a reconnect here, and that is correct
