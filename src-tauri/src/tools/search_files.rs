@@ -1,11 +1,12 @@
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ignore::{WalkBuilder, WalkState};
 use serde_json::{json, Value};
 
+use crate::file_index::FileIndex;
 use crate::security;
 use crate::unicode;
 
@@ -20,6 +21,7 @@ use crate::unicode;
 pub async fn handle(
     params: Value,
     scoped_folders: &[String],
+    index: &FileIndex,
 ) -> Result<(Value, Option<u64>), String> {
     let query = params
         .get("query")
@@ -37,17 +39,43 @@ pub async fn handle(
         .get("file_types")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-    // Determine search roots
-    let search_roots: Vec<String> = if let Some(path) = params.get("path").and_then(|v| v.as_str())
-    {
-        // Validate the specified path
+    // An explicit `path` restricts the search to a subtree; validate it against
+    // scope up front (applies to both filename and content search).
+    let path_param = params.get("path").and_then(|v| v.as_str());
+    if let Some(path) = path_param {
         security::validate_path(path, scoped_folders).map_err(|e| e.to_string())?;
-        vec![path.to_string()]
-    } else {
-        // Search all scoped folders
-        scoped_folders.to_vec()
-    };
+    }
 
+    // Filename/path search is served from the in-memory index — no disk walk on
+    // repeat queries. The index prunes denied dirs/files at build time and is
+    // refreshed incrementally (unchanged directories are reused).
+    if !search_content {
+        index.refresh(scoped_folders);
+        let query_lower = query.to_lowercase();
+        let root_filter = path_param.map(PathBuf::from);
+        let hits = index.search_names(
+            &query_lower,
+            root_filter.as_deref(),
+            file_types.as_deref(),
+            limit,
+        );
+        let results: Vec<Value> = hits
+            .iter()
+            .map(|f| {
+                json!({
+                    "path": unicode::normalize_whitespace(&f.path.display().to_string()),
+                    "name": unicode::normalize_whitespace(&f.name),
+                })
+            })
+            .collect();
+        return Ok((json!({ "results": results }), None));
+    }
+
+    // Content search must read file bodies, so it still walks the tree.
+    let search_roots: Vec<String> = match path_param {
+        Some(path) => vec![path.to_string()],
+        None => scoped_folders.to_vec(),
+    };
     if search_roots.is_empty() {
         return Ok((json!({ "results": [] }), None));
     }
@@ -116,27 +144,15 @@ pub async fn handle(
                 }
             }
 
-            let hit = if search_content {
-                search_file_content(entry_path, query_lower.as_str()).map(|context| {
-                    json!({
-                        "path": unicode::normalize_whitespace(&entry_path.display().to_string()),
-                        "name": unicode::normalize_whitespace(&file_name),
-                        "match_context": context,
-                    })
+            // Only content search reaches the walker; filename/path search is
+            // served from the index above.
+            let hit = search_file_content(entry_path, query_lower.as_str()).map(|context| {
+                json!({
+                    "path": unicode::normalize_whitespace(&entry_path.display().to_string()),
+                    "name": unicode::normalize_whitespace(&file_name),
+                    "match_context": context,
                 })
-            } else {
-                // Match against the normalized name so queries with ASCII space
-                // still find files with Unicode whitespace.
-                let normalized_name = unicode::normalize_whitespace(&file_name);
-                if normalized_name.to_lowercase().contains(query_lower.as_str()) {
-                    Some(json!({
-                        "path": unicode::normalize_whitespace(&entry_path.display().to_string()),
-                        "name": normalized_name,
-                    }))
-                } else {
-                    None
-                }
-            };
+            });
 
             if let Some(hit) = hit {
                 let mut guard = results.lock().unwrap();
@@ -254,7 +270,7 @@ mod tests {
         tree.write("todo.txt", "content");
         tree.write("nested/notebook.md", "content");
 
-        let (value, _) = handle(json!({ "query": "note" }), &tree.scoped())
+        let (value, _) = handle(json!({ "query": "note" }), &tree.scoped(), &FileIndex::new())
             .await
             .unwrap();
         let found = names(&value);
@@ -271,6 +287,7 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "needle", "search_content": true }),
             &tree.scoped(),
+            &FileIndex::new(),
         )
         .await
         .unwrap();
@@ -290,6 +307,7 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "app", "file_types": ["rs"] }),
             &tree.scoped(),
+            &FileIndex::new(),
         )
         .await
         .unwrap();
@@ -306,6 +324,7 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "needle123", "search_content": true }),
             &tree.scoped(),
+            &FileIndex::new(),
         )
         .await
         .unwrap();
@@ -324,6 +343,7 @@ mod tests {
         let result = handle(
             json!({ "query": "a", "path": outside }),
             &tree.scoped(),
+            &FileIndex::new(),
         )
         .await;
         assert!(result.is_err(), "expected out-of-scope error, got {result:?}");
@@ -341,6 +361,7 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "needle_x", "search_content": true }),
             &tree.scoped(),
+            &FileIndex::new(),
         )
         .await
         .unwrap();
@@ -358,6 +379,7 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "match", "limit": 2 }),
             &tree.scoped(),
+            &FileIndex::new(),
         )
         .await
         .unwrap();
