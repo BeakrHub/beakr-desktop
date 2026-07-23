@@ -9,6 +9,7 @@
 mod binary;
 mod claude;
 mod codex;
+pub mod readiness;
 pub mod runner;
 
 use std::time::Duration;
@@ -58,11 +59,29 @@ pub async fn handle_streaming(
     let params: Params =
         serde_json::from_value(params).map_err(|e| format!("bad_params: {e}"))?;
 
-    // Adapter selection (detect+default is a Settings concern; explicit here).
-    let runner: &'static dyn LocalCodingRunner = match params.cli.as_deref() {
-        None | Some("claude") => &claude::ClaudeRunner,
+    let settings = crate::config::load_settings(app);
+    // Adapter selection: an explicit engine request wins; otherwise the
+    // user's default-CLI setting (ENG-1536 picker); otherwise claude (the
+    // pre-picker behavior).
+    let requested_cli = params.cli.as_deref().or(settings.default_cli.as_deref());
+    let runner: &'static dyn LocalCodingRunner = match requested_cli {
+        Some("claude") => &claude::ClaudeRunner,
         Some("codex") => &codex::CodexRunner,
         Some(other) => return Err(format!("bad_params: unknown cli '{other}'")),
+        None => {
+            // Auto-default (David, 2026-07-17): run the CLI the user actually
+            // HAS — a codex-only machine must not exec a claude binary that
+            // isn't there. Claude wins the tie when both are installed, and
+            // is the fallback when neither is (so the error carries the
+            // primary CLI's install guidance).
+            if binary::resolve("claude", settings.claude_binary_path.as_deref()).is_ok() {
+                &claude::ClaudeRunner
+            } else if binary::resolve("codex", None).is_ok() {
+                &codex::CodexRunner
+            } else {
+                &claude::ClaudeRunner
+            }
+        }
     };
 
     // The CLI's cwd must be inside a user-granted folder, same rule as every
@@ -82,7 +101,6 @@ pub async fn handle_streaming(
         .try_begin_coding_run()
         .ok_or("coding_run_busy: a coding run is already in progress on this device")?;
 
-    let settings = crate::config::load_settings(app);
     // Auth is agnostic (DESIGN.md decision 5): most Beakr users have a Claude
     // subscription, not an API key. We inject ANTHROPIC_API_KEY only if the
     // user explicitly set one; otherwise the CLI uses whatever login already
@@ -258,7 +276,7 @@ pub async fn handle_streaming(
     }
 
     let exited_ok = status.map(|s| s.success()).unwrap_or(false);
-    match final_result {
+    let outcome = match final_result {
         Some(result) if exited_ok && !result.is_error => {
             let mut data = serde_json::to_value(&result).unwrap_or_default();
             data["cli"] = serde_json::Value::String(runner.name().to_string());
@@ -270,7 +288,19 @@ pub async fn handle_streaming(
             result.result.as_deref().unwrap_or(&stderr_tail),
         )),
         None => Err(runner.classify_failure(status.and_then(|s| s.code()), &stderr_tail)),
+    };
+
+    // Feed the zero-cost readiness signal (ENG-1536): a successful run is
+    // proof of login; an auth_failed one is proof of its absence. Other
+    // failures say nothing about auth and leave the cache alone.
+    match &outcome {
+        Ok(_) => crate::config::record_cli_auth(app, runner.name(), true),
+        Err(e) if e.starts_with("auth_failed:") => {
+            crate::config::record_cli_auth(app, runner.name(), false)
+        }
+        Err(_) => {}
     }
+    outcome
 }
 
 /// Reflect run start/stop in the tray + frontend, and keep the active run
