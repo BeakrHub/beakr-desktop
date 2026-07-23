@@ -435,4 +435,73 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "chat-input.tsx");
     }
+
+    // Benchmark, not a correctness test. Run with:
+    //   cargo test --lib bench_index_vs_naive_walk -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn bench_index_vs_naive_walk() {
+        use std::time::Instant;
+
+        let tree = TempTree::new("bench");
+        // A realistic-ish tree: source files plus a big node_modules of junk
+        // (which the old code walked on every query and the index prunes).
+        for d in 0..20 {
+            for f in 0..50 {
+                tree.write(&format!("src/mod{d}/file{f}.rs"), "content");
+            }
+        }
+        for d in 0..40 {
+            for f in 0..50 {
+                tree.write(&format!("node_modules/pkg{d}/file{f}.js"), "junk");
+            }
+        }
+        let indexed_files = 20 * 50; // node_modules is pruned from the index
+        let scoped = tree.scoped();
+        let queries = ["file3", "mod1", "file49", "file0", "mod19"];
+        let rounds = 20u32;
+        let n = rounds * queries.len() as u32;
+
+        // Baseline: a naive walkdir per query over the whole tree (node_modules
+        // included), matching the pre-index behavior.
+        let t0 = Instant::now();
+        for _ in 0..rounds {
+            for q in &queries {
+                let mut hits = 0usize;
+                for entry in walkdir::WalkDir::new(&scoped[0]).into_iter().flatten() {
+                    if entry.file_type().is_file() {
+                        let name = entry.file_name().to_string_lossy().to_lowercase();
+                        if name.contains(q) {
+                            hits += 1;
+                        }
+                    }
+                }
+                std::hint::black_box(hits);
+            }
+        }
+        let naive = t0.elapsed();
+
+        // Indexed: build once (cold), then cached queries.
+        let index = FileIndex::new();
+        let tb = Instant::now();
+        index.ensure_fresh(&scoped);
+        let build = tb.elapsed();
+        let tq = Instant::now();
+        for _ in 0..rounds {
+            for q in &queries {
+                std::hint::black_box(index.search_names(q, None, None, 20).len());
+            }
+        }
+        let cached = tq.elapsed();
+
+        let per_naive = naive / n;
+        let per_cached = cached / n;
+        let speedup = per_naive.as_secs_f64() / per_cached.as_secs_f64().max(f64::MIN_POSITIVE);
+        println!("\n=== FileIndex benchmark ===");
+        println!("indexed files       : {indexed_files} (+2000 node_modules pruned)");
+        println!("naive walk / query  : {per_naive:?}  (total {naive:?})");
+        println!("index build (cold)  : {build:?}");
+        println!("cached query        : {per_cached:?}  (total {cached:?})");
+        println!("per-query speedup   : {speedup:.0}x");
+    }
 }
