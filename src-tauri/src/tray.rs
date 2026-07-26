@@ -16,6 +16,9 @@ pub struct TrayState {
     /// (ENG-1528). Clicking cancels the active run via the inflight registry,
     /// which SIGINTs the CLI's process group.
     pub stop_run_item: MenuItem<tauri::Wry>,
+    /// "Watch coding run in Terminal" — enabled while an active run has a
+    /// live log; clicking opens Terminal.app tailing it.
+    pub watch_run_item: MenuItem<tauri::Wry>,
     /// Opens the app/pairing window. Its label is state-aware: "Pair device"
     /// when no device is paired (it lands on the pairing screen) and "Open Beakr"
     /// once paired (the window is the device's status/folders/activity view, not
@@ -37,10 +40,15 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .enabled(false)
         .build(app)?;
 
+    let watch_run_item = MenuItemBuilder::with_id("watch_run", "Watch coding run in Terminal")
+        .enabled(false)
+        .build(app)?;
+
     // Store the menu item handles so we can update them at runtime.
     app.manage(TrayState {
         status_item: status_item.clone(),
         stop_run_item: stop_run_item.clone(),
+        watch_run_item: watch_run_item.clone(),
         settings_item: settings_item.clone(),
     });
 
@@ -50,6 +58,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .item(&status_item)
         .separator()
         .item(&settings_item)
+        .item(&watch_run_item)
         .item(&stop_run_item)
         .separator()
         .item(&quit_item)
@@ -67,6 +76,25 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(state) = app.try_state::<crate::state::AppState>() {
                     if crate::state::stop_active_coding_run(&state).is_none() {
                         log::debug!("Tray stop clicked with no active run");
+                    }
+                }
+            }
+            "watch_run" => {
+                if let Some(state) = app.try_state::<crate::state::AppState>() {
+                    let log_path = state
+                        .active_coding_run
+                        .read()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .and_then(|run| run.log_path);
+                    match log_path {
+                        Some(path) => {
+                            if let Err(e) = crate::tools::coding_agent::open_log_in_terminal(&path)
+                            {
+                                log::warn!("Watch in Terminal failed: {e}");
+                            }
+                        }
+                        None => log::debug!("Tray watch clicked with no active run log"),
                     }
                 }
             }
@@ -171,9 +199,13 @@ fn stop_item_appearance(run: Option<&ActiveCodingRun>) -> (String, bool) {
 /// (ENG-1528, enriched for ENG-1552 run visibility).
 pub fn update_tray_coding_run(app: &AppHandle, run: Option<&ActiveCodingRun>) {
     let (label, enabled) = stop_item_appearance(run);
+    // Watchable whenever an active run has a live log — including while
+    // Stopping, since the tail shows the run settle.
+    let watchable = run.is_some_and(|r| r.log_path.is_some());
     if let Some(tray_state) = app.try_state::<TrayState>() {
         let _ = tray_state.stop_run_item.set_text(&label);
         let _ = tray_state.stop_run_item.set_enabled(enabled);
+        let _ = tray_state.watch_run_item.set_enabled(watchable);
     }
 }
 
@@ -188,6 +220,7 @@ mod tests {
             cli: "claude".into(),
             started_at_ms: 0,
             status,
+            log_path: None,
         }
     }
 

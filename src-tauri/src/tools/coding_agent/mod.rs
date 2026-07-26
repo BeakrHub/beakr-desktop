@@ -10,7 +10,10 @@ mod binary;
 mod claude;
 mod codex;
 pub mod readiness;
+mod run_log;
 pub mod runner;
+
+pub use run_log::open_log_in_terminal;
 
 use std::time::Duration;
 
@@ -24,9 +27,12 @@ use crate::ws::inflight::CancelSignal;
 use crate::ws::ToolStream;
 use runner::{Chunk, LocalCodingRunner, ParsedLine, RunResult, RunSpec};
 
-/// Hard ceiling on a single run. Long enough for a real coding task, short
-/// enough that a wedged CLI can't hold the coding slot forever.
-const RUN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Default ceiling on a single run. Long enough for a real coding task, short
+/// enough that a wedged CLI can't hold the coding slot forever. The engine's
+/// detached (wait=false) runs raise it via `timeout_minutes`, clamped below.
+const DEFAULT_RUN_TIMEOUT_MINUTES: u64 = 15;
+/// Absolute ceiling a request can ask for (detached runs use 6h).
+const MAX_RUN_TIMEOUT_MINUTES: u64 = 360;
 /// After a cancel SIGINT, how long the CLI gets to exit cleanly (saving its
 /// session for resume) before the whole group is SIGTERMed.
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
@@ -40,6 +46,20 @@ struct Params {
     cli: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    /// Requested run ceiling in minutes. Clamped to
+    /// [1, MAX_RUN_TIMEOUT_MINUTES]; absent (older engines) keeps the
+    /// 15-minute default. Sent by the engine's detached (wait=false) mode.
+    #[serde(default)]
+    timeout_minutes: Option<u64>,
+}
+
+/// The effective run ceiling for a request — never trusts the wire value
+/// beyond the clamp.
+fn run_timeout(requested_minutes: Option<u64>) -> Duration {
+    let minutes = requested_minutes
+        .unwrap_or(DEFAULT_RUN_TIMEOUT_MINUTES)
+        .clamp(1, MAX_RUN_TIMEOUT_MINUTES);
+    Duration::from_secs(minutes * 60)
 }
 
 pub fn handles(tool: &str) -> bool {
@@ -58,6 +78,7 @@ pub async fn handle_streaming(
 ) -> Result<(serde_json::Value, Option<u64>), String> {
     let params: Params =
         serde_json::from_value(params).map_err(|e| format!("bad_params: {e}"))?;
+    let timeout = run_timeout(params.timeout_minutes);
 
     let settings = crate::config::load_settings(app);
     // Adapter selection: an explicit engine request wins; otherwise the
@@ -136,6 +157,14 @@ pub async fn handle_streaming(
     let mut child = GroupChild::spawn(&mut cmd)
         .map_err(|e| format!("spawn_failed: could not start {}: {e}", runner.name()))?;
     state.processes.register(stream.request_id(), &child);
+    // Human-readable live log for the local terminal view. Best-effort: a
+    // failure to create it never blocks the run.
+    let mut run_log = run_log::RunLog::create(
+        app,
+        stream.request_id(),
+        runner.name(),
+        &working_dir_display,
+    );
     set_run_ui(
         app,
         state,
@@ -148,6 +177,7 @@ pub async fn handle_streaming(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
             status: CodingRunStatus::Running,
+            log_path: run_log.as_ref().map(|l| l.path.display().to_string()),
         }),
     )
     .await;
@@ -173,10 +203,14 @@ pub async fn handle_streaming(
     });
 
     // Main pump: stdout lines → normalized chunks → response_chunk frames.
+    // Accumulated audit metadata rides the terminal response too, so a
+    // detached consumer that never saw the chunk stream still gets it.
     let mut lines = BufReader::new(stdout).lines();
     let mut final_result: Option<RunResult> = None;
     let mut cancelled = false;
-    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+    let mut files_changed: Vec<String> = Vec::new();
+    let mut commands: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
         tokio::select! {
@@ -184,11 +218,13 @@ pub async fn handle_streaming(
                 match line {
                     Ok(Some(line)) => match runner.parse_line(&line) {
                         ParsedLine::Chunk(chunk) => {
+                            record_chunk(&chunk, &mut files_changed, &mut commands, &mut run_log);
                             let data = serde_json::to_value(&chunk).unwrap_or_default();
                             stream.chunk(data).await;
                         }
                         ParsedLine::Chunks(chunks) => {
                             for chunk in &chunks {
+                                record_chunk(chunk, &mut files_changed, &mut commands, &mut run_log);
                                 let data = serde_json::to_value(chunk).unwrap_or_default();
                                 stream.chunk(data).await;
                             }
@@ -237,11 +273,15 @@ pub async fn handle_streaming(
             _ = tokio::time::sleep_until(deadline) => {
                 child.terminate();
                 cleanup(app, state, stream.request_id()).await;
-                return Err(format!(
+                let message = format!(
                     "run_timeout: coding run exceeded {} minutes and was stopped; \
                      the session may be resumable",
-                    RUN_TIMEOUT.as_secs() / 60
-                ));
+                    timeout.as_secs() / 60
+                );
+                if let Some(log) = run_log.as_mut() {
+                    log.finish_error(&message);
+                }
+                return Err(message);
             }
         }
     }
@@ -264,12 +304,17 @@ pub async fn handle_streaming(
     if cancelled {
         // Terminal response still goes out (LSP cancel semantics); carry the
         // session id so the next turn can resume where the user stopped it.
+        if let Some(log) = run_log.as_mut() {
+            log.finish(None, None, true);
+        }
         let session_id = final_result.and_then(|r| r.session_id);
         return Ok((
             serde_json::json!({
                 "cancelled": true,
                 "session_id": session_id,
                 "cli": runner.name(),
+                "files_changed": files_changed,
+                "commands": commands,
             }),
             None,
         ));
@@ -281,6 +326,8 @@ pub async fn handle_streaming(
             let mut data = serde_json::to_value(&result).unwrap_or_default();
             data["cli"] = serde_json::Value::String(runner.name().to_string());
             data["cancelled"] = serde_json::Value::Bool(false);
+            data["files_changed"] = serde_json::to_value(&files_changed).unwrap_or_default();
+            data["commands"] = serde_json::to_value(&commands).unwrap_or_default();
             Ok((data, None))
         }
         Some(result) => Err(runner.classify_failure(
@@ -289,6 +336,22 @@ pub async fn handle_streaming(
         )),
         None => Err(runner.classify_failure(status.and_then(|s| s.code()), &stderr_tail)),
     };
+    match &outcome {
+        Ok((data, _)) => {
+            if let Some(log) = run_log.as_mut() {
+                log.finish(
+                    data.get("result").and_then(|v| v.as_str()),
+                    data.get("total_cost_usd").and_then(|v| v.as_f64()),
+                    false,
+                );
+            }
+        }
+        Err(error) => {
+            if let Some(log) = run_log.as_mut() {
+                log.finish_error(error);
+            }
+        }
+    }
 
     // Feed the zero-cost readiness signal (ENG-1536): a successful run is
     // proof of login; an auth_failed one is proof of its absence. Other
@@ -301,6 +364,29 @@ pub async fn handle_streaming(
         Err(_) => {}
     }
     outcome
+}
+
+/// Fold one outbound chunk into the run's audit accumulators and its live
+/// log. The same vocabulary both adapters emit, so this is CLI-agnostic.
+fn record_chunk(
+    chunk: &Chunk,
+    files_changed: &mut Vec<String>,
+    commands: &mut Vec<String>,
+    run_log: &mut Option<run_log::RunLog>,
+) {
+    if chunk.kind == "file_changed" {
+        if let Some(path) = &chunk.path {
+            files_changed.push(path.clone());
+        }
+    }
+    if chunk.kind == "command" {
+        if let Some(command) = &chunk.command {
+            commands.push(command.clone());
+        }
+    }
+    if let Some(log) = run_log.as_mut() {
+        log.chunk(chunk);
+    }
 }
 
 /// Reflect run start/stop in the tray + frontend, and keep the active run
@@ -347,4 +433,57 @@ async fn mark_run_stopping(app: &AppHandle, state: &AppState) {
 async fn cleanup(app: &AppHandle, state: &AppState, request_id: &str) {
     state.processes.unregister(request_id);
     set_run_ui(app, state, None).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_timeout_defaults_and_clamps_the_wire_value() {
+        // Absent (older engines) keeps the 15-minute ceiling; a detached
+        // request raises it, but never beyond the absolute maximum and never
+        // to zero.
+        assert_eq!(run_timeout(None), Duration::from_secs(15 * 60));
+        assert_eq!(run_timeout(Some(360)), Duration::from_secs(360 * 60));
+        assert_eq!(run_timeout(Some(100_000)), Duration::from_secs(360 * 60));
+        assert_eq!(run_timeout(Some(0)), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn record_chunk_accumulates_files_and_commands() {
+        let mut files = Vec::new();
+        let mut commands = Vec::new();
+        let mut no_log = None;
+        record_chunk(
+            &Chunk {
+                path: Some("/repo/a.py".into()),
+                change: Some("modify"),
+                ..Chunk::bare("file_changed")
+            },
+            &mut files,
+            &mut commands,
+            &mut no_log,
+        );
+        record_chunk(
+            &Chunk {
+                command: Some("/bin/zsh -lc 'cargo test'".into()),
+                ..Chunk::bare("command")
+            },
+            &mut files,
+            &mut commands,
+            &mut no_log,
+        );
+        record_chunk(
+            &Chunk {
+                text: Some("thinking".into()),
+                ..Chunk::bare("text")
+            },
+            &mut files,
+            &mut commands,
+            &mut no_log,
+        );
+        assert_eq!(files, vec!["/repo/a.py".to_string()]);
+        assert_eq!(commands, vec!["/bin/zsh -lc 'cargo test'".to_string()]);
+    }
 }

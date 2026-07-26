@@ -2,6 +2,7 @@ mod benchling;
 pub mod coding_agent;
 mod file_info;
 mod list_files;
+mod open_terminal;
 mod read_file;
 mod reveal_file;
 mod search_files;
@@ -34,6 +35,7 @@ pub async fn dispatch_request(
         "read_file" => read_file::handle(params, scoped_folders, &state.file_index).await,
         "file_info" => file_info::handle(params, scoped_folders).await,
         "reveal_file" => reveal_file::handle(params, scoped_folders).await,
+        "open_terminal" => open_terminal::handle(params, scoped_folders).await,
         other => Err(format!("Unknown tool: {other}")),
     }
 }

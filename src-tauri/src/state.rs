@@ -70,6 +70,9 @@ pub struct ActiveCodingRun {
     /// from this instead of the backend streaming ticks.
     pub started_at_ms: u64,
     pub status: CodingRunStatus,
+    /// Absolute path of the run's human-readable live log, when one could be
+    /// created — what "Watch in Terminal" tails. None disables that affordance.
+    pub log_path: Option<String>,
 }
 
 /// Shared application state, accessible from commands and the WS client.
@@ -157,11 +160,13 @@ mod coding_run_tests {
             cli: "claude".into(),
             started_at_ms: 1_700_000_000_000,
             status: CodingRunStatus::Stopping,
+            log_path: Some("/logs/coding-runs/req-1.log".into()),
         };
         let v = serde_json::to_value(&run).unwrap();
         assert_eq!(v["status"], "stopping");
         assert_eq!(v["working_dir"], "/Users/d/repo");
         assert_eq!(v["started_at_ms"], 1_700_000_000_000u64);
+        assert_eq!(v["log_path"], "/logs/coding-runs/req-1.log");
     }
 
     #[test]
@@ -180,6 +185,7 @@ mod coding_run_tests {
             cli: "claude".into(),
             started_at_ms: 0,
             status: CodingRunStatus::Running,
+            log_path: None,
         });
 
         assert_eq!(stop_active_coding_run(&state), Some("req-9".into()));

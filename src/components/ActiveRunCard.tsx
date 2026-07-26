@@ -22,7 +22,7 @@ function formatElapsed(ms: number): string {
  * card never claims a run is gone while it may still be editing files.
  */
 export default function ActiveRunCard() {
-  const { run, stop } = useCodingRun();
+  const { run, stop, watch } = useCodingRun();
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -73,6 +73,24 @@ export default function ActiveRunCard() {
             {formatElapsed(now - run.started_at_ms)}
           </div>
         </div>
+        {run.log_path && (
+          <button
+            onClick={() => void watch().catch(() => undefined)}
+            title="Open a Terminal window tailing this run's live log"
+            style={{
+              padding: "0.4rem 0.9rem",
+              borderRadius: 6,
+              border: "1px solid #d1d5db",
+              backgroundColor: "#fff",
+              color: "#374151",
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            Watch
+          </button>
+        )}
         <button
           onClick={() => void stop()}
           disabled={stopping}

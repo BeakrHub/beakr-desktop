@@ -8,6 +8,8 @@ export interface ActiveCodingRun {
   cli: string;
   started_at_ms: number;
   status: "running" | "stopping";
+  /** Path of the run's live plain-text log; null when logging failed. */
+  log_path: string | null;
 }
 
 /**
@@ -45,6 +47,8 @@ export function useCodingRun() {
   }, []);
 
   const stop = () => invoke<boolean>("stop_coding_run");
+  // Opens Terminal.app tailing the run's live log (macOS).
+  const watch = () => invoke<void>("open_run_terminal");
 
-  return { run, stop };
+  return { run, stop, watch };
 }

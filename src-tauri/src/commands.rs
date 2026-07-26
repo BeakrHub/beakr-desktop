@@ -477,3 +477,18 @@ pub fn get_active_coding_run(
 pub fn stop_coding_run(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(crate::state::stop_active_coding_run(&state).is_some())
 }
+
+/// Open Terminal.app tailing the active coding run's live log — the local
+/// "watch what Claude/Codex is doing" view. Shares the tray item's path.
+#[tauri::command]
+pub fn open_run_terminal(state: State<'_, AppState>) -> Result<(), String> {
+    let log_path = state
+        .active_coding_run
+        .read()
+        .expect("active run lock poisoned")
+        .clone()
+        .ok_or("no coding run is active")?
+        .log_path
+        .ok_or("this run has no live log")?;
+    crate::tools::coding_agent::open_log_in_terminal(&log_path)
+}
