@@ -43,22 +43,25 @@ impl GroupChild {
 
     /// Graceful cancel: SIGINT to the whole group — both CLIs treat SIGINT as
     /// "interrupt cleanly" (session state stays resumable).
-    pub fn interrupt(&self) {
+    pub fn interrupt(&mut self) {
         self.signal_group(libc_signal::SIGINT);
     }
 
     /// Firm stop: SIGTERM to the whole group.
-    pub fn terminate(&self) {
+    pub fn terminate(&mut self) {
         self.signal_group(libc_signal::SIGTERM);
     }
 
     /// Last resort: SIGKILL to the whole group.
-    pub fn kill_group(&self) {
+    pub fn kill_group(&mut self) {
         self.signal_group(libc_signal::SIGKILL);
     }
 
+    // Takes `&mut self` for the Windows arm's sake: `Child::start_kill` needs a
+    // mutable receiver. Unix does not need it (killpg goes through the stored
+    // pgid), but the signature is shared, so both arms take it.
     #[cfg(unix)]
-    fn signal_group(&self, sig: i32) {
+    fn signal_group(&mut self, sig: i32) {
         if self.pgid > 0 {
             // SAFETY: killpg with a validated positive pgid; failure (already
             // exited) is benign and reported by errno, which we ignore.
@@ -69,10 +72,11 @@ impl GroupChild {
     }
 
     #[cfg(not(unix))]
-    fn signal_group(&self, _sig: i32) {
+    fn signal_group(&mut self, _sig: i32) {
         // Windows: no process groups in this model — kill the direct child.
-        // start_kill() is async-signal-safe here (does not require &mut self
-        // polling); ignore failure if it already exited.
+        // Every signal collapses to the same kill; the CLI's subtree is left to
+        // ENG-206. `start_kill` only signals (no reaping), so it does not block;
+        // the later `wait()` reaps. Ignore failure: the child may already be gone.
         let _ = self.child.start_kill();
     }
 
