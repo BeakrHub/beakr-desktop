@@ -1,0 +1,68 @@
+name: CI
+
+# Compile gate for pull requests. release.yml only runs on tags, so before this
+# workflow a platform-specific break could not surface until a release was
+# already half-published: v0.4.0 shipped macOS-only because the Windows arm of
+# process_group.rs had never been compiled (dev is macOS). Checking both
+# platforms here catches that in minutes instead of mid-release.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: ci-${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # `generate_context!` embeds frontendDist (../dist) at compile time, so
+      # the frontend must be built before cargo can check the crate.
+      - name: Build frontend
+        run: npm run build
+
+      # --all-targets so test code is type-checked too, not just the lib.
+      - name: Cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --all-targets
+
+      # Unix-only: the test suite covers the process-group/pgid paths that do
+      # not exist on Windows, and Windows has no runner-side equivalent yet.
+      - name: Cargo test
+        if: matrix.os == 'macos-latest'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
