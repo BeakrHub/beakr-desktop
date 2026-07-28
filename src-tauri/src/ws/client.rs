@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use rand::Rng;
 use tauri::{AppHandle, Emitter};
 use tokio::net::TcpStream;
@@ -26,6 +26,12 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often we re-check the liveness deadline.
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Maximum time one socket write may occupy the connection loop. Every
+/// heartbeat, Ping, response, and folder update is sent by that single loop.
+/// Without a deadline, a half-open socket whose write buffer never drains can
+/// trap the loop inside `send()` forever, preventing both future heartbeats and
+/// the liveness check that would otherwise reconnect it.
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Outbound frame buffer between spawned request tasks and the socket loop.
 /// Sized for bursts of streamed chunks; senders await (backpressure) when full.
@@ -46,6 +52,22 @@ const REVOKE_403_THRESHOLD: u32 = 5;
 /// run() can count consecutive occurrences across reconnect attempts.
 const HANDSHAKE_403_MARKER: &str = "handshake_403_forbidden";
 const CLOSE_SESSION_EXPIRED: u16 = 4011;
+
+async fn send_with_deadline<S>(
+    write: &mut S,
+    message: Message,
+    deadline: Duration,
+) -> Result<(), String>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    match tokio::time::timeout(deadline, write.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("WebSocket write failed: {error}")),
+        Err(_) => Err(format!("WebSocket write timed out after {deadline:?}")),
+    }
+}
 
 pub struct WsClient {
     app: AppHandle,
@@ -256,7 +278,12 @@ impl WsClient {
         };
 
         let register_json = serde_json::to_string(&register)?;
-        write.send(Message::Text(register_json)).await?;
+        send_with_deadline(
+            &mut write,
+            Message::Text(register_json),
+            SOCKET_WRITE_TIMEOUT,
+        )
+        .await?;
 
         // Wait for registered response
         let registered_msg = tokio::time::timeout(Duration::from_secs(10), read.next())
@@ -346,7 +373,10 @@ impl WsClient {
                 _ = heartbeat.tick() => {
                     let msg = serde_json::to_string(&OutgoingMessage::Heartbeat)
                         .unwrap_or_default();
-                    if write.send(Message::Text(msg)).await.is_err() {
+                    if let Err(error) =
+                        send_with_deadline(write, Message::Text(msg), SOCKET_WRITE_TIMEOUT).await
+                    {
+                        log::warn!("Heartbeat write failed: {error}; reconnecting");
                         return None;
                     }
                 }
@@ -354,9 +384,13 @@ impl WsClient {
                 _ = ping.tick() => {
                     // Active liveness probe: on a dead path the Pong never comes
                     // back, so `last_inbound` goes stale and the liveness branch
-                    // below forces a reconnect. (A `write.send` that errors here —
-                    // e.g. once the OS finally times out the socket — also exits.)
-                    if write.send(Message::Ping(Vec::new())).await.is_err() {
+                    // below forces a reconnect. A write error or deadline here
+                    // also exits instead of trapping the whole loop.
+                    if let Err(error) =
+                        send_with_deadline(write, Message::Ping(Vec::new()), SOCKET_WRITE_TIMEOUT)
+                            .await
+                    {
+                        log::warn!("Ping write failed: {error}; reconnecting");
                         return None;
                     }
                 }
@@ -377,8 +411,14 @@ impl WsClient {
                     if let Some(msg) = outgoing {
                         match serde_json::to_string(&msg) {
                             Ok(json) => {
-                                if let Err(e) = write.send(Message::Text(json)).await {
-                                    log::error!("Failed to send outgoing frame: {e}");
+                                if let Err(error) = send_with_deadline(
+                                    write,
+                                    Message::Text(json),
+                                    SOCKET_WRITE_TIMEOUT,
+                                )
+                                .await
+                                {
+                                    log::error!("Failed to send outgoing frame: {error}");
                                     return None;
                                 }
                             }
@@ -422,7 +462,10 @@ impl WsClient {
                     let msg = serde_json::to_string(&OutgoingMessage::UpdateFolders {
                         scoped_folders: folders,
                     }).unwrap_or_default();
-                    if write.send(Message::Text(msg)).await.is_err() {
+                    if let Err(error) =
+                        send_with_deadline(write, Message::Text(msg), SOCKET_WRITE_TIMEOUT).await
+                    {
+                        log::warn!("Folder update write failed: {error}; reconnecting");
                         return None;
                     }
                     log::info!("Sent folder update to server");
@@ -433,7 +476,12 @@ impl WsClient {
                     // notify permit left over from a previous disconnect must not
                     // close a freshly re-established connection.
                     if self.state.shutdown_requested.load(Ordering::SeqCst) {
-                        let _ = write.send(Message::Close(None)).await;
+                        let _ = send_with_deadline(
+                            write,
+                            Message::Close(None),
+                            SOCKET_WRITE_TIMEOUT,
+                        )
+                        .await;
                         return None;
                     }
                 }
@@ -636,8 +684,41 @@ pub fn os_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
     use tokio_tungstenite::tungstenite::Error;
+
+    struct NeverReadySink;
+
+    impl Sink<Message> for NeverReadySink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn http_error(status: StatusCode) -> Error {
         let body: Option<Vec<u8>> = None;
@@ -709,6 +790,24 @@ mod tests {
         // register()) before `is_online` goes stale and strands the Ask "+".
         assert!(PING_INTERVAL < LIVENESS_TIMEOUT);
         assert!(LIVENESS_TIMEOUT < Duration::from_secs(60));
+        assert!(SOCKET_WRITE_TIMEOUT < LIVENESS_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn stalled_socket_write_hits_deadline_instead_of_starving_heartbeats() {
+        // Regression (ENG-1536, observed 2026-07-23): the desktop process stayed
+        // alive while its last heartbeat became stale. A socket send that never
+        // becomes writable must return control to the reconnect loop instead of
+        // blocking heartbeat, Ping, and liveness branches forever.
+        let error = send_with_deadline(
+            &mut NeverReadySink,
+            Message::Text("heartbeat".to_string()),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("a permanently backpressured socket must time out");
+
+        assert!(error.contains("timed out"));
     }
 }
 
