@@ -13,6 +13,8 @@ pub mod unicode;
 mod ws;
 
 use state::AppState;
+#[cfg(target_os = "windows")]
+use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
 
 /// Returns the WebSocket URL based on build configuration.
@@ -52,6 +54,27 @@ pub fn run() {
     let app_state = AppState::new();
 
     tauri::Builder::default()
+        // Must be registered first so a duplicate process exits before other
+        // plugins initialize. Reuse the tray/Dock window recovery path so the
+        // surviving instance is shown, unminimized, and focused.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_settings_window(app);
+
+            // On Windows the callback runs synchronously while the secondary
+            // process is still inside its WM_COPYDATA handoff. The first focus
+            // request can be rejected until that foreground-capable process
+            // exits, so retry once after the handoff has returned.
+            #[cfg(target_os = "windows")]
+            {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if let Some(window) = app.get_webview_window("settings") {
+                        let _ = window.set_focus();
+                    }
+                });
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
