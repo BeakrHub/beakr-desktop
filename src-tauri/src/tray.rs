@@ -10,6 +10,34 @@ const WINDOW_LABEL: &str = "settings";
 const WINDOW_TITLE: &str = "Beakr Desktop";
 
 #[cfg(target_os = "windows")]
+fn exit_after_fatal_window_failure(_app: &AppHandle, detail: String) {
+    log::error!("Failed to create settings window: {detail}");
+    log::logger().flush();
+
+    // Tauri's graceful exit request is intentionally intercepted to keep the
+    // Windows tray app resident. This failure is unrecoverable, so terminate
+    // with an explicit status after the diagnostic record is durable.
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "windows")]
+fn windows_webview_runtime_error() -> Option<String> {
+    if let Some(configured_folder) = std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") {
+        let configured_folder = std::path::PathBuf::from(configured_folder);
+        if !configured_folder.is_dir() {
+            return Some(format!(
+                "configured WebView2 folder is unavailable: {}",
+                configured_folder.display()
+            ));
+        }
+    }
+
+    tauri::webview_version()
+        .err()
+        .map(|e| format!("WebView2 runtime is unavailable: {e}"))
+}
+
+#[cfg(target_os = "windows")]
 fn is_windows_tray_open_gesture(
     button: tauri::tray::MouseButton,
     button_state: tauri::tray::MouseButtonState,
@@ -155,6 +183,21 @@ pub fn show_settings_window(app: &AppHandle) {
         return;
     }
 
+    #[cfg(target_os = "windows")]
+    if let Some(error) = windows_webview_runtime_error() {
+        use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+
+        app.dialog()
+            .message(
+                "Could not find the WebView2 Runtime.\n\nMake sure it is installed or download it from https://developer.microsoft.com/en-us/microsoft-edge/webview2\n\nYou may have it installed on another user account, but it is not available for this one.",
+            )
+            .title("Error")
+            .kind(MessageDialogKind::Error)
+            .blocking_show();
+        exit_after_fatal_window_failure(app, error);
+        return;
+    }
+
     // Create window — hide on close instead of destroying
     let builder = tauri::WebviewWindowBuilder::new(
         app,
@@ -177,6 +220,14 @@ pub fn show_settings_window(app: &AppHandle) {
             });
         }
         Err(e) => {
+            // A Windows agent without a usable WebView2 runtime can never
+            // present pairing, status, or recovery UI. Do not remain in the
+            // background looking healthy; the native runtime dialog already
+            // explained the problem, and the file logger preserves the cause.
+            #[cfg(target_os = "windows")]
+            exit_after_fatal_window_failure(app, e.to_string());
+
+            #[cfg(not(target_os = "windows"))]
             log::error!("Failed to create settings window: {e}");
         }
     }

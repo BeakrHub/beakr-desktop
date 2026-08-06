@@ -45,12 +45,6 @@ fn spawn_benchling_liveness(app_handle: tauri::AppHandle, state: AppState) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Default to showing info-level logs in dev mode
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "beakr_desktop=info");
-    }
-    env_logger::init();
-
     let app_state = AppState::new();
 
     tauri::Builder::default()
@@ -75,6 +69,13 @@ pub fn run() {
                 });
             }
         }))
+        // The default targets write both to stdout and to the platform log
+        // directory (on Windows: %LOCALAPPDATA%\com.thebeakr.desktop\logs).
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
