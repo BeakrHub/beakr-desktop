@@ -13,6 +13,8 @@ pub mod unicode;
 mod ws;
 
 use state::AppState;
+#[cfg(target_os = "windows")]
+use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
 
 /// Returns the WebSocket URL based on build configuration.
@@ -28,6 +30,13 @@ pub fn ws_url() -> String {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn should_prevent_exit(exit_code: Option<i32>) -> bool {
+    // A window-count/user exit has no code. Explicit app.exit()/restart() calls
+    // carry a code and must remain able to terminate the tray application.
+    exit_code.is_none()
+}
+
 fn spawn_benchling_liveness(app_handle: tauri::AppHandle, state: AppState) {
     tauri::async_runtime::spawn(session::benchling::watch_session_liveness(
         app_handle, state,
@@ -36,15 +45,37 @@ fn spawn_benchling_liveness(app_handle: tauri::AppHandle, state: AppState) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Default to showing info-level logs in dev mode
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "beakr_desktop=info");
-    }
-    env_logger::init();
-
     let app_state = AppState::new();
 
     tauri::Builder::default()
+        // Must be registered first so a duplicate process exits before other
+        // plugins initialize. Reuse the tray/Dock window recovery path so the
+        // surviving instance is shown, unminimized, and focused.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_settings_window(app);
+
+            // On Windows the callback runs synchronously while the secondary
+            // process is still inside its WM_COPYDATA handoff. The first focus
+            // request can be rejected until that foreground-capable process
+            // exits, so retry once after the handoff has returned.
+            #[cfg(target_os = "windows")]
+            {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if let Some(window) = app.get_webview_window("settings") {
+                        let _ = window.set_focus();
+                    }
+                });
+            }
+        }))
+        // The default targets write both to stdout and to the platform log
+        // directory (on Windows: %LOCALAPPDATA%\com.thebeakr.desktop\logs).
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -209,6 +240,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, _event| {
+            // Windows/Linux tray applications must stay resident after their last
+            // window closes. Keep explicit app.exit()/restart() working, and do
+            // not change macOS's normal Cmd-Q / application-menu quit behaviour.
+            #[cfg(not(target_os = "macos"))]
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = _event {
+                if should_prevent_exit(code) {
+                    api.prevent_exit();
+                }
+            }
+
             // macOS fires Reopen when the Dock icon is clicked (and on
             // Finder/Spotlight re-launch of a running app). Only open the
             // settings window when nothing is visible — a Dock click while
@@ -225,4 +266,20 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod lifecycle_tests {
+    use super::should_prevent_exit;
+
+    #[test]
+    fn user_or_last_window_exit_is_prevented_for_tray_lifetime() {
+        assert!(should_prevent_exit(None));
+    }
+
+    #[test]
+    fn explicit_exit_and_restart_remain_allowed() {
+        assert!(!should_prevent_exit(Some(0)));
+        assert!(!should_prevent_exit(Some(1)));
+    }
 }

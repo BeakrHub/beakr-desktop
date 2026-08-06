@@ -9,6 +9,48 @@ use crate::state::{ActiveCodingRun, CodingRunStatus, ConnectionStatus};
 const WINDOW_LABEL: &str = "settings";
 const WINDOW_TITLE: &str = "Beakr Desktop";
 
+#[cfg(target_os = "windows")]
+fn exit_after_fatal_window_failure(_app: &AppHandle, detail: String) {
+    log::error!("Failed to create settings window: {detail}");
+    log::logger().flush();
+
+    // Tauri's graceful exit request is intentionally intercepted to keep the
+    // Windows tray app resident. This failure is unrecoverable, so terminate
+    // with an explicit status after the diagnostic record is durable.
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "windows")]
+fn windows_webview_runtime_error() -> Option<String> {
+    if let Some(configured_folder) = std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") {
+        let configured_folder = std::path::PathBuf::from(configured_folder);
+        if !configured_folder.is_dir() {
+            return Some(format!(
+                "configured WebView2 folder is unavailable: {}",
+                configured_folder.display()
+            ));
+        }
+    }
+
+    tauri::webview_version()
+        .err()
+        .map(|e| format!("WebView2 runtime is unavailable: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_tray_open_gesture(
+    button: tauri::tray::MouseButton,
+    button_state: tauri::tray::MouseButtonState,
+) -> bool {
+    matches!(
+        (button, button_state),
+        (
+            tauri::tray::MouseButton::Left,
+            tauri::tray::MouseButtonState::Up
+        )
+    )
+}
+
 /// Holds the tray menu items whose text we update at runtime.
 pub struct TrayState {
     pub status_item: MenuItem<tauri::Wry>,
@@ -64,10 +106,26 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .item(&quit_item)
         .build()?;
 
-    let _tray = TrayIconBuilder::new()
+    let tray_builder = TrayIconBuilder::new()
         .icon(app.default_window_icon().cloned().unwrap())
         .menu(&menu)
-        .tooltip("Beakr Desktop")
+        .tooltip("Beakr Desktop");
+
+    #[cfg(target_os = "windows")]
+    let tray_builder = tray_builder.on_tray_icon_event(|tray, event| {
+        if let tauri::tray::TrayIconEvent::Click {
+            button,
+            button_state,
+            ..
+        } = event
+        {
+            if is_windows_tray_open_gesture(button, button_state) {
+                show_settings_window(tray.app_handle());
+            }
+        }
+    });
+
+    let _tray = tray_builder
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "settings" => {
                 show_settings_window(app);
@@ -125,6 +183,21 @@ pub fn show_settings_window(app: &AppHandle) {
         return;
     }
 
+    #[cfg(target_os = "windows")]
+    if let Some(error) = windows_webview_runtime_error() {
+        use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+
+        app.dialog()
+            .message(
+                "Could not find the WebView2 Runtime.\n\nMake sure it is installed or download it from https://developer.microsoft.com/en-us/microsoft-edge/webview2\n\nYou may have it installed on another user account, but it is not available for this one.",
+            )
+            .title("Error")
+            .kind(MessageDialogKind::Error)
+            .blocking_show();
+        exit_after_fatal_window_failure(app, error);
+        return;
+    }
+
     // Create window — hide on close instead of destroying
     let builder = tauri::WebviewWindowBuilder::new(
         app,
@@ -147,6 +220,14 @@ pub fn show_settings_window(app: &AppHandle) {
             });
         }
         Err(e) => {
+            // A Windows agent without a usable WebView2 runtime can never
+            // present pairing, status, or recovery UI. Do not remain in the
+            // background looking healthy; the native runtime dialog already
+            // explained the problem, and the file logger preserves the cause.
+            #[cfg(target_os = "windows")]
+            exit_after_fatal_window_failure(app, e.to_string());
+
+            #[cfg(not(target_os = "windows"))]
             log::error!("Failed to create settings window: {e}");
         }
     }
@@ -212,6 +293,25 @@ pub fn update_tray_coding_run(app: &AppHandle, run: Option<&ActiveCodingRun>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_primary_tray_release_is_the_open_window_gesture() {
+        use tauri::tray::{MouseButton, MouseButtonState};
+
+        assert!(is_windows_tray_open_gesture(
+            MouseButton::Left,
+            MouseButtonState::Up
+        ));
+        assert!(!is_windows_tray_open_gesture(
+            MouseButton::Left,
+            MouseButtonState::Down
+        ));
+        assert!(!is_windows_tray_open_gesture(
+            MouseButton::Right,
+            MouseButtonState::Up
+        ));
+    }
 
     fn run(status: CodingRunStatus) -> ActiveCodingRun {
         ActiveCodingRun {
