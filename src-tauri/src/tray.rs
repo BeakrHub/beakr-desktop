@@ -9,6 +9,20 @@ use crate::state::{ActiveCodingRun, CodingRunStatus, ConnectionStatus};
 const WINDOW_LABEL: &str = "settings";
 const WINDOW_TITLE: &str = "Beakr Desktop";
 
+#[cfg(target_os = "windows")]
+fn is_windows_tray_open_gesture(
+    button: tauri::tray::MouseButton,
+    button_state: tauri::tray::MouseButtonState,
+) -> bool {
+    matches!(
+        (button, button_state),
+        (
+            tauri::tray::MouseButton::Left,
+            tauri::tray::MouseButtonState::Up
+        )
+    )
+}
+
 /// Holds the tray menu items whose text we update at runtime.
 pub struct TrayState {
     pub status_item: MenuItem<tauri::Wry>,
@@ -64,10 +78,26 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .item(&quit_item)
         .build()?;
 
-    let _tray = TrayIconBuilder::new()
+    let tray_builder = TrayIconBuilder::new()
         .icon(app.default_window_icon().cloned().unwrap())
         .menu(&menu)
-        .tooltip("Beakr Desktop")
+        .tooltip("Beakr Desktop");
+
+    #[cfg(target_os = "windows")]
+    let tray_builder = tray_builder.on_tray_icon_event(|tray, event| {
+        if let tauri::tray::TrayIconEvent::Click {
+            button,
+            button_state,
+            ..
+        } = event
+        {
+            if is_windows_tray_open_gesture(button, button_state) {
+                show_settings_window(tray.app_handle());
+            }
+        }
+    });
+
+    let _tray = tray_builder
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "settings" => {
                 show_settings_window(app);
@@ -212,6 +242,25 @@ pub fn update_tray_coding_run(app: &AppHandle, run: Option<&ActiveCodingRun>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_primary_tray_release_is_the_open_window_gesture() {
+        use tauri::tray::{MouseButton, MouseButtonState};
+
+        assert!(is_windows_tray_open_gesture(
+            MouseButton::Left,
+            MouseButtonState::Up
+        ));
+        assert!(!is_windows_tray_open_gesture(
+            MouseButton::Left,
+            MouseButtonState::Down
+        ));
+        assert!(!is_windows_tray_open_gesture(
+            MouseButton::Right,
+            MouseButtonState::Up
+        ));
+    }
 
     fn run(status: CodingRunStatus) -> ActiveCodingRun {
         ActiveCodingRun {
