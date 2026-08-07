@@ -93,24 +93,24 @@ fn via_windows_path_with(
     pathext: Option<&str>,
 ) -> Option<PathBuf> {
     let path = path?;
-    let mut names = vec![std::ffi::OsString::from(name)];
-    if Path::new(name).extension().is_none() {
+    let names = if Path::new(name).extension().is_none() {
         let extensions = pathext.unwrap_or(".COM;.EXE;.BAT;.CMD");
-        names.extend(
-            extensions
-                .split(';')
-                .map(str::trim)
-                .filter(|extension| !extension.is_empty())
-                .map(|extension| {
-                    let extension = if extension.starts_with('.') {
-                        extension.to_string()
-                    } else {
-                        format!(".{extension}")
-                    };
-                    std::ffi::OsString::from(format!("{name}{extension}"))
-                }),
-        );
-    }
+        extensions
+            .split(';')
+            .map(str::trim)
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| {
+                let extension = if extension.starts_with('.') {
+                    extension.to_string()
+                } else {
+                    format!(".{extension}")
+                };
+                std::ffi::OsString::from(format!("{name}{extension}"))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![std::ffi::OsString::from(name)]
+    };
 
     for directory in std::env::split_paths(path) {
         for executable_name in &names {
@@ -201,6 +201,10 @@ mod tests {
     #[test]
     fn windows_path_honors_pathext_scripts() {
         let dir = tempfile::tempdir().unwrap();
+        // npm creates both a Unix shebang shim with no extension and a .cmd
+        // launcher. Windows must skip the former or CreateProcess fails with
+        // ERROR_BAD_EXE_FORMAT (193).
+        std::fs::write(dir.path().join("codex"), "#!/usr/bin/env node\n").unwrap();
         let script = dir.path().join("codex.cmd");
         std::fs::write(&script, "@echo off\r\necho codex-test\r\n").unwrap();
         let path = std::env::join_paths([dir.path()]).unwrap();
