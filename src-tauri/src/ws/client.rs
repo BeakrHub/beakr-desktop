@@ -606,6 +606,19 @@ fn current_platform() -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_version(output: &str) -> Option<String> {
+    output
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find(|candidate| {
+            candidate.contains('.')
+                && candidate.split('.').all(|segment| {
+                    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+        .map(str::to_string)
+}
+
 pub fn os_version() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -619,12 +632,18 @@ pub fn os_version() -> String {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        let mut command = std::process::Command::new("cmd");
+        command
             .args(["/C", "ver"])
+            .creation_flags(CREATE_NO_WINDOW);
+        command
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
+            .and_then(|output| parse_windows_version(&output))
             .unwrap_or_else(|| "unknown".to_string())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -642,6 +661,28 @@ mod tests {
     fn http_error(status: StatusCode) -> Error {
         let body: Option<Vec<u8>> = None;
         Error::Http(Response::builder().status(status).body(body).unwrap())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_os_version_is_bare_numeric_version() {
+        let version = os_version();
+
+        assert!(
+            version.split('.').all(|segment| {
+                !segment.is_empty() && segment.chars().all(|character| character.is_ascii_digit())
+            }),
+            "expected a bare numeric Windows version, got {version:?}"
+        );
+    }
+
+    #[test]
+    fn windows_ver_output_is_reduced_to_numeric_version() {
+        assert_eq!(
+            parse_windows_version("\r\nMicrosoft Windows [Version 10.0.26200.8875]\r\n"),
+            Some("10.0.26200.8875".to_string())
+        );
+        assert_eq!(parse_windows_version("unexpected output"), None);
     }
 
     #[test]
