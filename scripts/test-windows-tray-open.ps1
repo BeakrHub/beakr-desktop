@@ -106,8 +106,8 @@ try {
     }
 
     $before = @(Get-TauriWindowState $process.Id)
-    if (-not ($before | Where-Object { -not $_.Visible })) {
-        throw "Precondition failed: paired release had no hidden Tauri window."
+    if ($before | Where-Object { $_.Visible }) {
+        throw "Precondition failed: paired release already had a visible Tauri window."
     }
 
     $tray = Find-TrayElement "Beakr Desktop"

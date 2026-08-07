@@ -118,8 +118,8 @@ try {
     }
 
     $before = @(Get-TauriWindowState $first.Process.Id)
-    if (-not ($before | Where-Object { -not $_.Visible })) {
-        throw "Precondition failed: first paired launch had no hidden Tauri window."
+    if ($before | Where-Object { $_.Visible }) {
+        throw "Precondition failed: first paired launch already had a visible Tauri window."
     }
 
     $second = Start-TestInstance "second"

@@ -78,6 +78,8 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // startup, and claim_pairing_code/clear_token update it as pairing changes.
     let settings_item = MenuItemBuilder::with_id("settings", "Pair device").build(app)?;
 
+    let open_logs_item = MenuItemBuilder::with_id("open_logs", "Open log folder").build(app)?;
+
     let stop_run_item = MenuItemBuilder::with_id("stop_run", "Stop coding run")
         .enabled(false)
         .build(app)?;
@@ -100,6 +102,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .item(&status_item)
         .separator()
         .item(&settings_item)
+        .item(&open_logs_item)
         .item(&watch_run_item)
         .item(&stop_run_item)
         .separator()
@@ -129,6 +132,11 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "settings" => {
                 show_settings_window(app);
+            }
+            "open_logs" => {
+                if let Err(error) = crate::diagnostics::open_log_folder(app.clone()) {
+                    log::error!("Could not open log folder: {error}");
+                }
             }
             "stop_run" => {
                 if let Some(state) = app.try_state::<crate::state::AppState>() {
