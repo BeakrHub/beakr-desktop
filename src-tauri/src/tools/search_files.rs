@@ -10,6 +10,15 @@ use crate::file_index::FileIndex;
 use crate::security;
 use crate::unicode;
 
+const MAX_CLOUD_ONLY_PATHS_REPORTED: usize = 20;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ContentSearchOutcome {
+    Match(String),
+    NoMatch,
+    CloudOnly,
+}
+
 /// Handle a `search_files` request.
 ///
 /// Params:
@@ -99,12 +108,16 @@ pub async fn handle(
     let file_types = Arc::new(file_types);
     let results = Arc::new(Mutex::new(Vec::<Value>::new()));
     let count = Arc::new(AtomicUsize::new(0));
+    let skipped_cloud_count = Arc::new(AtomicUsize::new(0));
+    let skipped_cloud_files = Arc::new(Mutex::new(Vec::<Value>::new()));
 
     builder.build_parallel().run(|| {
         let query_lower = Arc::clone(&query_lower);
         let file_types = Arc::clone(&file_types);
         let results = Arc::clone(&results);
         let count = Arc::clone(&count);
+        let skipped_cloud_count = Arc::clone(&skipped_cloud_count);
+        let skipped_cloud_files = Arc::clone(&skipped_cloud_files);
         Box::new(move |entry| {
             // Enough already found — stop dispatching new work.
             if count.load(Ordering::Relaxed) >= limit {
@@ -148,13 +161,27 @@ pub async fn handle(
 
             // Only content search reaches the walker; filename/path search is
             // served from the index above.
-            let hit = search_file_content(entry_path, query_lower.as_str()).map(|context| {
-                json!({
+            let hit = match search_file_content(entry_path, query_lower.as_str()) {
+                ContentSearchOutcome::Match(context) => Some(json!({
                     "path": unicode::normalize_whitespace(&entry_path.display().to_string()),
                     "name": unicode::normalize_whitespace(&file_name),
                     "match_context": context,
-                })
-            });
+                })),
+                ContentSearchOutcome::CloudOnly => {
+                    skipped_cloud_count.fetch_add(1, Ordering::Relaxed);
+                    let mut guard = skipped_cloud_files.lock().unwrap();
+                    if guard.len() < MAX_CLOUD_ONLY_PATHS_REPORTED {
+                        guard.push(json!({
+                            "path": unicode::normalize_whitespace(
+                                &entry_path.display().to_string()
+                            ),
+                            "reason": "not searched (cloud-only)",
+                        }));
+                    }
+                    None
+                }
+                ContentSearchOutcome::NoMatch => None,
+            };
 
             if let Some(hit) = hit {
                 let mut guard = results.lock().unwrap();
@@ -171,17 +198,66 @@ pub async fn handle(
 
     let mut out = std::mem::take(&mut *results.lock().unwrap());
     out.truncate(limit);
-    Ok((json!({ "results": out }), None))
+    let cloud_only_files = std::mem::take(&mut *skipped_cloud_files.lock().unwrap());
+    Ok((
+        json!({
+            "results": out,
+            "skipped_cloud_files": {
+                "count": skipped_cloud_count.load(Ordering::Relaxed),
+                "files": cloud_only_files,
+            },
+        }),
+        None,
+    ))
 }
 
-/// Search a file's content for the query string. Returns the first matching line as context.
-fn search_file_content(path: &Path, query: &str) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
+#[cfg(target_os = "windows")]
+fn is_cloud_only(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+    };
+
+    std::fs::symlink_metadata(path)
+        .map(|metadata| {
+            let attributes = metadata.file_attributes();
+            attributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_cloud_only(_path: &Path) -> bool {
+    false
+}
+
+/// Search a file's content for the query string. Cloud-only Windows files are
+/// classified before `File::open`, which prevents OneDrive hydration.
+fn search_file_content(path: &Path, query: &str) -> ContentSearchOutcome {
+    search_file_content_with_residency_check(path, query, is_cloud_only)
+}
+
+fn search_file_content_with_residency_check(
+    path: &Path,
+    query: &str,
+    is_cloud_only: impl FnOnce(&Path) -> bool,
+) -> ContentSearchOutcome {
+    if is_cloud_only(path) {
+        return ContentSearchOutcome::CloudOnly;
+    }
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return ContentSearchOutcome::NoMatch,
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return ContentSearchOutcome::NoMatch,
+    };
 
     // Skip large files and binaries
     if metadata.len() > 10 * 1024 * 1024 {
-        return None;
+        return ContentSearchOutcome::NoMatch;
     }
 
     let reader = BufReader::new(file);
@@ -189,7 +265,7 @@ fn search_file_content(path: &Path, query: &str) -> Option<String> {
     for (line_num, line) in reader.lines().enumerate() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => return None, // Likely binary
+            Err(_) => return ContentSearchOutcome::NoMatch, // Likely binary
         };
 
         if line.to_lowercase().contains(query) {
@@ -198,11 +274,11 @@ fn search_file_content(path: &Path, query: &str) -> Option<String> {
             } else {
                 format!("L{}: {}", line_num + 1, line)
             };
-            return Some(context);
+            return ContentSearchOutcome::Match(context);
         }
     }
 
-    None
+    ContentSearchOutcome::NoMatch
 }
 
 #[cfg(test)]
@@ -263,6 +339,20 @@ mod tests {
             .iter()
             .map(|r| r.get("name").unwrap().as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn content_search_skips_cloud_only_file_before_opening_it() {
+        let missing = Path::new(r"C:\BeakrFixtures\cloud-only.txt");
+
+        let outcome = search_file_content_with_residency_check(
+            missing,
+            "needle",
+            |_| true,
+        );
+
+        assert!(matches!(outcome, ContentSearchOutcome::CloudOnly));
     }
 
     #[tokio::test]
