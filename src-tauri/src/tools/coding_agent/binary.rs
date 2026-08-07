@@ -85,11 +85,15 @@ mod tests {
 
     #[test]
     fn explicit_override_wins_and_must_be_executable() {
-        // /bin/ls is always executable on macOS/Linux.
-        let ok = resolve("anything", Some("/bin/ls"));
-        assert_eq!(ok.unwrap(), PathBuf::from("/bin/ls"));
+        // The current test executable is a real executable on every platform.
+        let executable = std::env::current_exe().unwrap();
+        let executable_text = executable.to_string_lossy();
+        let ok = resolve("anything", Some(&executable_text));
+        assert_eq!(ok.unwrap(), executable);
 
-        let missing = resolve("anything", Some("/nonexistent/claude"));
+        let missing_path = std::env::temp_dir().join("beakr-definitely-missing-cli");
+        let missing_text = missing_path.to_string_lossy();
+        let missing = resolve("anything", Some(&missing_text));
         assert!(missing.unwrap_err().starts_with("binary_not_found:"));
     }
 
@@ -101,6 +105,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn login_shell_finds_standard_tools() {
         // `ls` exists in every login shell PATH — proves the resolution path
         // itself works end-to-end without depending on claude being installed.
