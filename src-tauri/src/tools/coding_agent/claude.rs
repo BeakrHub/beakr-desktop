@@ -19,6 +19,7 @@ use std::path::Path;
 
 use tokio::process::Command;
 
+use super::binary;
 use super::runner::{Chunk, LocalCodingRunner, ParsedLine, RunResult, RunSpec};
 
 pub struct ClaudeRunner;
@@ -89,7 +90,7 @@ impl LocalCodingRunner for ClaudeRunner {
     }
 
     fn build_command(&self, binary: &Path, spec: &RunSpec) -> Command {
-        let mut cmd = Command::new(binary);
+        let mut cmd = binary::command(binary);
         cmd.current_dir(&spec.working_dir)
             .arg("-p")
             .arg(&spec.prompt)
@@ -203,7 +204,7 @@ impl LocalCodingRunner for ClaudeRunner {
             // Subscription-first message (DESIGN.md decision 5): the common
             // fix is logging into Claude Code, not adding an API key.
             return format!(
-                "auth_failed: Claude Code isn't logged in on this Mac. Open Claude Code and \
+                "auth_failed: Claude Code isn't logged in on this computer. Open Claude Code and \
                  log in (or add an API key in Beakr Desktop settings). ({stderr_tail})"
             );
         }

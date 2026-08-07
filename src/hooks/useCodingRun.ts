@@ -47,7 +47,7 @@ export function useCodingRun() {
   }, []);
 
   const stop = () => invoke<boolean>("stop_coding_run");
-  // Opens Terminal.app tailing the run's live log (macOS).
+  // Opens the platform terminal tailing the run's live log.
   const watch = () => invoke<void>("open_run_terminal");
 
   return { run, stop, watch };
