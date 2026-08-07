@@ -190,9 +190,44 @@ pub fn open_log_in_terminal(log_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Open a new PowerShell console tailing the run log. `CREATE_NEW_CONSOLE`
+/// matters because Beakr itself is a GUI process without an attached console.
+#[cfg(target_os = "windows")]
+pub fn open_log_in_terminal(log_path: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+    let log = Path::new(log_path);
+    if !log.is_file() {
+        return Err("the run's log file does not exist yet".to_string());
+    }
+
+    let command = format!(
+        "$Host.UI.RawUI.WindowTitle = 'Beakr coding run'; Clear-Host; \
+         Write-Host 'Beakr coding run - live view (Ctrl+C stops watching; the run continues)'; \
+         Write-Host ''; Get-Content -LiteralPath {} -Wait",
+        powershell_literal(log_path)
+    );
+    std::process::Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NoExit", "-Command"])
+        .arg(command)
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not open PowerShell live view: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn open_log_in_terminal(_log_path: &str) -> Result<(), String> {
-    Err("watching a run in a terminal is only supported on macOS".to_string())
+    Err("watching a run in a terminal is not supported on this platform".to_string())
 }
 
 #[cfg(test)]
@@ -263,5 +298,14 @@ mod tests {
         let content = read(dir.path());
         assert!(content.contains("== run failed ==\nauth_failed: not logged in"));
         assert!(content.contains("== run stopped by the user =="));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_log_path_is_a_safe_powershell_literal() {
+        assert_eq!(
+            powershell_literal(r"C:\Users\O'Brien\coding run.log"),
+            r"'C:\Users\O''Brien\coding run.log'"
+        );
     }
 }
