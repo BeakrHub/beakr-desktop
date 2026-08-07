@@ -59,7 +59,7 @@ pub struct TrayState {
     /// which SIGINTs the CLI's process group.
     pub stop_run_item: MenuItem<tauri::Wry>,
     /// "Watch coding run in Terminal" — enabled while an active run has a
-    /// live log; clicking opens Terminal.app tailing it.
+    /// live log; clicking opens the platform terminal tailing it.
     pub watch_run_item: MenuItem<tauri::Wry>,
     /// Opens the app/pairing window. Its label is state-aware: "Pair device"
     /// when no device is paired (it lands on the pairing screen) and "Open Beakr"

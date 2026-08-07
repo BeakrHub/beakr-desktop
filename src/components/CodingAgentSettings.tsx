@@ -127,7 +127,7 @@ export default function CodingAgentSettings() {
         Coding Agent
       </h2>
       <p style={{ fontSize: "0.78rem", color: "#666", marginTop: 0, marginBottom: "0.75rem" }}>
-        Beakr can run a coding agent CLI on this Mac when you ask it to. Each
+        Beakr can run a coding agent CLI on this computer when you ask it to. Each
         CLI uses its own login and your own plan — Beakr never handles the
         credential.
       </p>
@@ -143,7 +143,7 @@ export default function CodingAgentSettings() {
             marginBottom: "0.75rem",
           }}
         >
-          No coding agents detected on this Mac. Install one to use this
+          No coding agents detected on this computer. Install one to use this
           feature — Claude Code: <code>{CLI_META.claude.installCmd}</code> or
           Codex: <code>{CLI_META.codex.installCmd}</code> — then sign in and
           reopen this window.
