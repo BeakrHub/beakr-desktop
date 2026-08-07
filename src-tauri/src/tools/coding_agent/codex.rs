@@ -25,6 +25,7 @@ use std::path::Path;
 
 use tokio::process::Command;
 
+use super::binary;
 use super::runner::{Chunk, LocalCodingRunner, ParsedLine, RunResult, RunSpec};
 
 pub struct CodexRunner;
@@ -100,7 +101,7 @@ impl LocalCodingRunner for CodexRunner {
         // to the resumed turn. Canonical shape (works for fresh and resume):
         //   codex exec --json --sandbox workspace-write --skip-git-repo-check
         //     --cd <dir> [resume <thread_id>] -- <prompt>
-        let mut cmd = Command::new(binary);
+        let mut cmd = binary::command(binary);
         cmd.current_dir(&spec.working_dir);
         cmd.arg("exec")
             .arg("--json")
@@ -259,7 +260,7 @@ impl LocalCodingRunner for CodexRunner {
             || lower.contains("authentication")
         {
             return format!(
-                "auth_failed: Codex isn't logged in on this Mac. Run `codex login` in a \
+                "auth_failed: Codex isn't logged in on this computer. Run `codex login` in a \
                  terminal and try again. ({stderr_tail})"
             );
         }

@@ -108,7 +108,7 @@ fn login_state(presence: Presence, cached_auth_ok: Option<bool>) -> &'static str
 }
 
 fn presence_for(cli: &str) -> Presence {
-    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let home = binary::home_dir().unwrap_or_default();
     let fs_presence = credential_presence_in(cli, &home);
     if cli == "claude" && fs_presence == Presence::Unknown {
         return claude_keychain_presence();
@@ -119,9 +119,7 @@ fn presence_for(cli: &str) -> Presence {
 /// `<binary> --version`, best-effort with a hard timeout. Local spawn only —
 /// never an API call.
 async fn probe_version(binary: &std::path::Path) -> Option<String> {
-    let fut = tokio::process::Command::new(binary)
-        .arg("--version")
-        .output();
+    let fut = binary::command(binary).arg("--version").output();
     let out = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
         .await
         .ok()?

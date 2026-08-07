@@ -478,7 +478,7 @@ pub fn stop_coding_run(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(crate::state::stop_active_coding_run(&state).is_some())
 }
 
-/// Open Terminal.app tailing the active coding run's live log — the local
+/// Open the platform terminal tailing the active coding run's live log — the local
 /// "watch what Claude/Codex is doing" view. Shares the tray item's path.
 #[tauri::command]
 pub fn open_run_terminal(state: State<'_, AppState>) -> Result<(), String> {
