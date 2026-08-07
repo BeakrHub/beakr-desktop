@@ -100,6 +100,15 @@ pub fn run() {
             );
             log::logger().flush();
 
+            // ENG-1953: Windows only. Fail fast if WebView2 is missing, before
+            // the updater, the WebSocket client or the Benchling restore start.
+            // Any of those can reach a webview, and a webview call without a
+            // runtime panics on a worker thread — which kills the task and
+            // leaves the process alive and headless. Nothing below this line
+            // may run when the runtime is unusable.
+            #[cfg(target_os = "windows")]
+            tray::ensure_webview_runtime_or_exit(app.handle());
+
             // ENG-1377: keep the default Regular activation policy so the app has
             // a Dock icon users can click to open it. Do not set
             // ActivationPolicy::Accessory — tray-only proved too hidden (notched

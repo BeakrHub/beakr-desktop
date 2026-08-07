@@ -11,13 +11,42 @@ const WINDOW_TITLE: &str = "Beakr Desktop";
 
 #[cfg(target_os = "windows")]
 fn exit_after_fatal_window_failure(_app: &AppHandle, detail: String) {
-    log::error!("Failed to create settings window: {detail}");
+    // Reached from the startup preflight as well as from window creation, so
+    // the message must not claim a window was being created.
+    log::error!("Fatal: the app cannot show any UI. {detail}");
     log::logger().flush();
 
     // Tauri's graceful exit request is intentionally intercepted to keep the
     // Windows tray app resident. This failure is unrecoverable, so terminate
     // with an explicit status after the diagnostic record is durable.
     std::process::exit(1);
+}
+
+#[cfg(target_os = "windows")]
+const WEBVIEW2_MISSING_MESSAGE: &str = "Could not find the WebView2 Runtime.\n\nMake sure it is installed or download it from https://developer.microsoft.com/en-us/microsoft-edge/webview2\n\nYou may have it installed on another user account, but it is not available for this one.";
+
+/// Windows: confirm the WebView2 runtime is usable, or terminate.
+///
+/// Must be called from `setup()` before any background task starts. Without a
+/// runtime, a webview call panics on whichever worker thread makes it — and a
+/// panic on a tokio worker kills only that task, not the process. The agent
+/// then keeps running with no UI and still registers with the backend as a
+/// healthy device, so the user sees "connected" and nothing they can click.
+/// Checking here, before anything can make that call, is what makes the
+/// failure fatal instead of silent.
+#[cfg(target_os = "windows")]
+pub fn ensure_webview_runtime_or_exit(app: &AppHandle) {
+    let Some(error) = windows_webview_runtime_error() else {
+        return;
+    };
+
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    app.dialog()
+        .message(WEBVIEW2_MISSING_MESSAGE)
+        .title("Error")
+        .kind(MessageDialogKind::Error)
+        .blocking_show();
+    exit_after_fatal_window_failure(app, error);
 }
 
 #[cfg(target_os = "windows")]
@@ -191,20 +220,11 @@ pub fn show_settings_window(app: &AppHandle) {
         return;
     }
 
+    // Normally a no-op: setup() already ran this before anything started. It
+    // stays here because the runtime can be uninstalled while the agent is
+    // resident, and this is the next moment we would otherwise touch it.
     #[cfg(target_os = "windows")]
-    if let Some(error) = windows_webview_runtime_error() {
-        use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
-
-        app.dialog()
-            .message(
-                "Could not find the WebView2 Runtime.\n\nMake sure it is installed or download it from https://developer.microsoft.com/en-us/microsoft-edge/webview2\n\nYou may have it installed on another user account, but it is not available for this one.",
-            )
-            .title("Error")
-            .kind(MessageDialogKind::Error)
-            .blocking_show();
-        exit_after_fatal_window_failure(app, error);
-        return;
-    }
+    ensure_webview_runtime_or_exit(app);
 
     // Create window — hide on close instead of destroying
     let builder = tauri::WebviewWindowBuilder::new(
@@ -319,6 +339,31 @@ mod tests {
             MouseButton::Right,
             MouseButtonState::Up
         ));
+    }
+
+    /// ENG-1953. The check itself was already correct; the defect was that it
+    /// only ran from `show_settings_window`, which a paired launch never calls.
+    /// This pins the detector that the startup preflight now relies on.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unusable_webview2_folder_is_reported_as_a_runtime_error() {
+        let bogus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("no-such-webview2-runtime-dir");
+        assert!(!bogus.is_dir(), "fixture path must not exist");
+
+        let previous = std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
+        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &bogus);
+        let detected = windows_webview_runtime_error();
+        match previous {
+            Some(v) => std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", v),
+            None => std::env::remove_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER"),
+        }
+
+        let detected = detected.expect("a missing WebView2 folder must be a fatal runtime error");
+        assert!(
+            detected.contains("unavailable"),
+            "error should name the unavailable folder, got: {detected}"
+        );
     }
 
     fn run(status: CodingRunStatus) -> ActiveCodingRun {
