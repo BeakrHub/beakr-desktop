@@ -347,7 +347,10 @@ mod tests {
         let hits = index.search_names("index", None, None, 20);
         let paths: Vec<String> = hits.iter().map(|f| f.path.display().to_string()).collect();
         assert_eq!(hits.len(), 1, "got {paths:?}");
-        assert!(paths[0].ends_with("src/index.js"), "got {paths:?}");
+        assert!(
+            hits[0].path.ends_with(Path::new("src").join("index.js")),
+            "got {paths:?}"
+        );
     }
 
     #[test]
