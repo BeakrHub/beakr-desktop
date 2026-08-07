@@ -35,8 +35,13 @@ hostname = "0.4"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
+<<<<<<< HEAD
 tauri-plugin-log = "2"
 open = { version = "5", features = ["shellexecute-on-windows"] }
+=======
+dunce = "1"
+env_logger = "0.11"
+>>>>>>> codex/eng-1954-verbatim-ingest
 url = "2"
 base64 = "0.22"
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }

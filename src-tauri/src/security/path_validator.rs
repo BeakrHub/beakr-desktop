@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use super::SecurityError;
 use crate::unicode;
 
+fn path_for_wire(path: &Path) -> PathBuf {
+    dunce::simplified(path).to_path_buf()
+}
+
 /// Validate that `path` resolves to a location within one of the `scoped_folders`.
 ///
 /// 1. Canonicalize the path (resolves symlinks, `..`, etc.)
@@ -46,7 +50,10 @@ pub fn validate_path(path: &str, scoped_folders: &[String]) -> Result<PathBuf, S
         };
 
         if canonical.starts_with(&folder_canonical) {
-            return Ok(canonical);
+            // Windows canonicalize() returns a verbatim path. Prefer the
+            // interoperable drive-letter form when it is safe, but retain the
+            // prefix for long/reserved paths that require Win32 verbatim APIs.
+            return Ok(path_for_wire(&canonical));
         }
     }
 
@@ -94,5 +101,34 @@ mod tests {
         let target = env::temp_dir().display().to_string();
         let result = validate_path(&target, &[]);
         assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn short_windows_path_uses_plain_wire_format() {
+        let root = env::temp_dir().join(format!("beakr_wire_path_{}", std::process::id()));
+        let file = root.join("notes.md");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&file, "notes").unwrap();
+
+        let result = validate_path(file.to_str().unwrap(), &[root.display().to_string()]).unwrap();
+
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            !result.to_string_lossy().starts_with(r"\\?\"),
+            "short path leaked verbatim prefix: {}",
+            result.display()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn long_windows_path_keeps_verbatim_prefix_for_wire() {
+        let segment_a = "a".repeat(126);
+        let segment_b = "b".repeat(126);
+        let path = PathBuf::from(format!(r"\\?\C:\{segment_a}\{segment_b}\notes.md"));
+        assert!(path.as_os_str().len() > 260);
+
+        assert_eq!(path_for_wire(&path), path);
     }
 }
