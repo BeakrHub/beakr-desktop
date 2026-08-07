@@ -6,12 +6,14 @@
 //! CLI in its OWN process group lets cancel/quit signal the whole tree at once.
 //!
 //! Unix: real process groups (`setpgid` via `process_group(0)`) + `killpg`.
-//! Windows: falls back to killing the direct child only (ENG-206 owns the
-//! Windows story; Codex's own sandbox limits the blast radius there).
+//! Windows: Job Objects own the CLI process tree and terminate all descendants
+//! together on cancel, quit, or last-handle close.
 
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use tokio::process::{Child, Command};
@@ -21,6 +23,81 @@ pub struct GroupChild {
     child: Child,
     #[cfg(unix)]
     pgid: i32,
+    #[cfg(windows)]
+    job: Arc<WindowsJob>,
+}
+
+#[cfg(windows)]
+struct WindowsJob {
+    handle: usize,
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn attach(child: &Child) -> std::io::Result<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(handle) };
+            return Err(error);
+        }
+
+        let process = match child.raw_handle() {
+            Some(process) => process,
+            None => {
+                unsafe { CloseHandle(handle) };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "child exited before assignment to a Windows Job Object",
+                ));
+            }
+        };
+        if unsafe { AssignProcessToJobObject(handle, process.cast()) } == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(handle) };
+            return Err(error);
+        }
+
+        Ok(Self {
+            handle: handle as usize,
+        })
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        unsafe {
+            TerminateJobObject(self.handle as _, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe { CloseHandle(self.handle as _) };
+    }
 }
 
 impl GroupChild {
@@ -31,13 +108,25 @@ impl GroupChild {
             // 0 = "same as the child's pid": the child leads a new group.
             cmd.as_std_mut().process_group(0);
         }
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
         #[cfg(unix)]
         let pgid = child.id().map(|id| id as i32).unwrap_or(-1);
+        #[cfg(windows)]
+        let job = match WindowsJob::attach(&child) {
+            Ok(job) => Arc::new(job),
+            Err(error) => {
+                // Do not return a live, uncontained coding CLI if process-tree
+                // ownership could not be established.
+                let _ = child.start_kill();
+                return Err(error);
+            }
+        };
         Ok(Self {
             child,
             #[cfg(unix)]
             pgid,
+            #[cfg(windows)]
+            job,
         })
     }
 
@@ -71,12 +160,16 @@ impl GroupChild {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn signal_group(&mut self, _sig: i32) {
-        // Windows: no process groups in this model — kill the direct child.
-        // Every signal collapses to the same kill; the CLI's subtree is left to
-        // ENG-206. `start_kill` only signals (no reaping), so it does not block;
-        // the later `wait()` reaps. Ignore failure: the child may already be gone.
+        // A background GUI app cannot deliver POSIX-style console signals.
+        // Terminate the Job Object so the CLI and every descendant exit as one
+        // contained tree; wait() below still reaps the direct child.
+        self.job.terminate();
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn signal_group(&mut self, _sig: i32) {
         let _ = self.child.start_kill();
     }
 
@@ -123,7 +216,11 @@ mod libc_signal {
 /// calls [`ProcessRegistry::kill_all`] before `app.exit(0)`.
 #[derive(Default)]
 pub struct ProcessRegistry {
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg(unix)]
+    groups: Mutex<HashMap<String, i32>>,
+    #[cfg(windows)]
+    groups: Mutex<HashMap<String, Arc<WindowsJob>>>,
+    #[cfg(not(any(unix, windows)))]
     groups: Mutex<HashMap<String, i32>>,
 }
 
@@ -142,7 +239,15 @@ impl ProcessRegistry {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub fn register(&self, request_id: &str, child: &GroupChild) {
+        self.groups
+            .lock()
+            .expect("process registry lock poisoned")
+            .insert(request_id.to_string(), Arc::clone(&child.job));
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn register(&self, _request_id: &str, _child: &GroupChild) {}
 
     pub fn unregister(&self, request_id: &str) {
@@ -151,7 +256,12 @@ impl ProcessRegistry {
             .lock()
             .expect("process registry lock poisoned")
             .remove(request_id);
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        self.groups
+            .lock()
+            .expect("process registry lock poisoned")
+            .remove(request_id);
+        #[cfg(not(any(unix, windows)))]
         let _ = request_id;
     }
 
@@ -163,10 +273,7 @@ impl ProcessRegistry {
     pub fn kill_all(&self) {
         #[cfg(unix)]
         {
-            let groups = self
-                .groups
-                .lock()
-                .expect("process registry lock poisoned");
+            let groups = self.groups.lock().expect("process registry lock poisoned");
             for pgid in groups.values() {
                 if *pgid > 0 {
                     // SAFETY: killpg with validated positive pgid (see above).
@@ -176,18 +283,25 @@ impl ProcessRegistry {
                 }
             }
         }
+        #[cfg(windows)]
+        {
+            let groups = self.groups.lock().expect("process registry lock poisoned");
+            for job in groups.values() {
+                job.terminate();
+            }
+        }
     }
 
     #[allow(dead_code)] // consumed by ENG-1528 (coding-run adapters)
     pub fn live_count(&self) -> usize {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.groups
                 .lock()
                 .expect("process registry lock poisoned")
                 .len()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             0
         }
@@ -256,5 +370,125 @@ mod tests {
             .expect("child exits on its own")
             .expect("wait succeeds");
         assert!(status.success(), "un-registered child must not be killed");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    fn process_is_running(pid: u32) -> bool {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return false;
+        }
+        let wait = unsafe { WaitForSingleObject(handle, 0) };
+        unsafe {
+            CloseHandle(handle);
+        }
+        wait == WAIT_TIMEOUT
+    }
+
+    #[tokio::test]
+    async fn interrupt_terminates_the_windows_child_tree() {
+        let script = "$child = Start-Process ping.exe -ArgumentList @('127.0.0.1','-n','60') -WindowStyle Hidden -PassThru; [Console]::WriteLine($child.Id); [Console]::Out.Flush(); Wait-Process -Id $child.Id";
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoLogo", "-NoProfile", "-Command", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = GroupChild::spawn(&mut command).expect("spawn parent and descendant");
+        let stdout = child.stdout_take().expect("parent stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let descendant_pid: u32 = tokio::time::timeout(Duration::from_secs(15), lines.next_line())
+            .await
+            .expect("parent reports descendant promptly")
+            .expect("stdout read succeeds")
+            .expect("descendant pid line exists")
+            .trim()
+            .parse()
+            .expect("descendant pid is numeric");
+        assert!(process_is_running(descendant_pid));
+
+        child.interrupt();
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("parent exits promptly")
+            .expect("wait succeeds");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let survived = process_is_running(descendant_pid);
+        if survived {
+            let _ = std::process::Command::new("taskkill.exe")
+                .args(["/PID", &descendant_pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        assert!(
+            !survived,
+            "descendant process {descendant_pid} was orphaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_kill_all_terminates_the_windows_child_tree() {
+        let script = "$child = Start-Process ping.exe -ArgumentList @('127.0.0.1','-n','60') -WindowStyle Hidden -PassThru; [Console]::WriteLine($child.Id); [Console]::Out.Flush(); Wait-Process -Id $child.Id";
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoLogo", "-NoProfile", "-Command", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = GroupChild::spawn(&mut command).expect("spawn parent and descendant");
+        let stdout = child.stdout_take().expect("parent stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let descendant_pid: u32 = tokio::time::timeout(Duration::from_secs(15), lines.next_line())
+            .await
+            .expect("parent reports descendant promptly")
+            .expect("stdout read succeeds")
+            .expect("descendant pid line exists")
+            .trim()
+            .parse()
+            .expect("descendant pid is numeric");
+        let registry = ProcessRegistry::new();
+        registry.register("windows-tree", &child);
+        assert_eq!(registry.live_count(), 1);
+
+        registry.kill_all();
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("registered parent exits promptly")
+            .expect("wait succeeds");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        registry.unregister("windows-tree");
+
+        let survived = process_is_running(descendant_pid);
+        if survived {
+            let _ = std::process::Command::new("taskkill.exe")
+                .args(["/PID", &descendant_pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        assert!(
+            !survived,
+            "descendant process {descendant_pid} survived kill_all"
+        );
+        assert_eq!(registry.live_count(), 0);
     }
 }
