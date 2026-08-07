@@ -73,10 +73,32 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn windows_explorer_select_raw_arg(path: &Path) -> std::ffi::OsString {
+    let mut argument = std::ffi::OsString::from("/select,\"");
+    argument.push(path.as_os_str());
+    argument.push("\"");
+    argument
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    // Explorer may return a non-zero status even after successfully selecting
+    // the file, so process creation is the only reliable result to inspect.
+    std::process::Command::new("explorer.exe")
+        .raw_arg(windows_explorer_select_raw_arg(path))
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to launch File Explorer: {e}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn reveal_in_file_manager(_path: &Path) -> Result<(), String> {
-    // Windows/Linux support arrives with ENG-206; better a clear error than
-    // a silent no-op the user interprets as a broken button.
+    // Better a clear error than a silent no-op the user interprets as a broken button.
     Err("Revealing files is not supported on this platform yet.".to_string())
 }
 
@@ -129,6 +151,19 @@ mod tests {
 
     fn never_reveal(_: &Path) -> Result<(), String> {
         panic!("reveal must not be called when validation fails");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_explorer_select_argument_preserves_native_path_and_spaces() {
+        use std::ffi::OsString;
+
+        let path = Path::new(r"C:\Dev\beakr-windows-test\onboarding checklist.txt");
+
+        assert_eq!(
+            windows_explorer_select_raw_arg(path),
+            OsString::from(r#"/select,"C:\Dev\beakr-windows-test\onboarding checklist.txt""#)
+        );
     }
 
     #[test]
