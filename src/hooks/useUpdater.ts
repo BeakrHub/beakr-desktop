@@ -35,9 +35,10 @@ export interface UpdaterState {
  * signed build, exposes the result to the UI, and installs + relaunches on
  * demand. Updater config (endpoint + pubkey) lives in tauri.conf.json.
  *
- * The app checks once on launch (silently — we only surface a banner when an
- * update is actually available) and again whenever the user clicks the manual
- * "Check for updates" button (not silent, so "up to date" is shown as feedback).
+ * The Rust application lifecycle performs an independent silent launch check
+ * so windowless agents still reach the feed. This hook also checks when the
+ * settings UI mounts so it can retain the Update handle needed for the banner
+ * and the user-approved download, install, and relaunch flow.
  */
 export function useUpdater(): UpdaterState {
   const [status, setStatus] = useState<UpdateStatus>("idle");
@@ -124,7 +125,8 @@ export function useUpdater(): UpdaterState {
     }
   }, []);
 
-  // Check once on launch, silently.
+  // Preserve the automatic banner for launches where the UI is reachable.
+  // Windowless startup reachability does not depend on this component.
   useEffect(() => {
     checkForUpdates({ silent: true });
   }, [checkForUpdates]);

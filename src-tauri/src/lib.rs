@@ -6,6 +6,7 @@ mod process_group;
 mod search_filter;
 mod security;
 mod session;
+mod startup_update;
 mod state;
 mod tools;
 mod tray;
@@ -64,6 +65,12 @@ pub fn run() {
 
             // Load persisted settings
             let settings = config::load_settings(app.handle());
+
+            // Check the updater feed from the application lifecycle rather
+            // than from React. Paired release builds deliberately launch with
+            // no window, so a component-mounted check is not reachable there.
+            startup_update::spawn(app.handle().clone());
+
             let has_stored_token = {
                 use tauri_plugin_store::StoreExt;
                 app.handle()
