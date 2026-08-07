@@ -18,6 +18,7 @@ export default function Settings({ onUnlink }: SettingsProps) {
   const [deviceName, setDeviceName] = useState("");
   const [editingName, setEditingName] = useState(false);
   const [deviceNameError, setDeviceNameError] = useState<string | null>(null);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const updater = useUpdater();
 
   useEffect(() => {
@@ -40,6 +41,17 @@ export default function Settings({ onUnlink }: SettingsProps) {
       setEditingName(false);
     } catch (e) {
       setDeviceNameError(typeof e === "string" ? e : "Could not save device name.");
+    }
+  };
+
+  const openLogFolder = async () => {
+    setDiagnosticsError(null);
+    try {
+      await invoke("open_log_folder");
+    } catch (e) {
+      setDiagnosticsError(
+        typeof e === "string" ? e : "Could not open the log folder."
+      );
     }
   };
 
@@ -168,6 +180,8 @@ export default function Settings({ onUnlink }: SettingsProps) {
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: "0.5rem",
         }}
       >
         <span style={{ fontSize: "0.75rem", color: "#999" }}>
@@ -175,26 +189,46 @@ export default function Settings({ onUnlink }: SettingsProps) {
           {updater.status === "uptodate" && " — up to date"}
           {updater.status === "checking" && " — checking…"}
         </span>
-        <button
-          onClick={() => updater.checkForUpdates()}
-          disabled={
-            updater.status === "checking" ||
-            updater.status === "downloading" ||
-            updater.status === "installing"
-          }
-          style={{
-            fontSize: "0.75rem",
-            padding: "0.25rem 0.6rem",
-            border: "1px solid #ddd",
-            borderRadius: 6,
-            background: "white",
-            cursor: updater.status === "checking" ? "default" : "pointer",
-            opacity: updater.status === "checking" ? 0.6 : 1,
-          }}
-        >
-          Check for updates
-        </button>
+        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+          <button
+            onClick={openLogFolder}
+            style={{
+              fontSize: "0.75rem",
+              padding: "0.25rem 0.6rem",
+              border: "1px solid #ddd",
+              borderRadius: 6,
+              background: "white",
+              cursor: "pointer",
+            }}
+          >
+            Open log folder
+          </button>
+          <button
+            onClick={() => updater.checkForUpdates()}
+            disabled={
+              updater.status === "checking" ||
+              updater.status === "downloading" ||
+              updater.status === "installing"
+            }
+            style={{
+              fontSize: "0.75rem",
+              padding: "0.25rem 0.6rem",
+              border: "1px solid #ddd",
+              borderRadius: 6,
+              background: "white",
+              cursor: updater.status === "checking" ? "default" : "pointer",
+              opacity: updater.status === "checking" ? 0.6 : 1,
+            }}
+          >
+            Check for updates
+          </button>
+        </div>
       </footer>
+      {diagnosticsError && (
+        <p role="alert" style={{ color: "#dc2626", fontSize: "0.75rem" }}>
+          {diagnosticsError}
+        </p>
+      )}
     </div>
   );
 }

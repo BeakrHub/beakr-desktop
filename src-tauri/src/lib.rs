@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod diagnostics;
 mod file_index;
 mod file_watch;
 mod process_group;
@@ -74,6 +75,8 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
+                .max_file_size(1_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
                 .build(),
         )
         .plugin(tauri_plugin_shell::init())
@@ -87,6 +90,15 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(app_state.clone())
         .setup(move |app| {
+            diagnostics::install_panic_hook();
+            diagnostics::spawn_log_flusher();
+            diagnostics::trigger_test_panic_if_configured();
+            log::info!(
+                "Beakr Desktop startup diagnostics initialized (process_id={})",
+                std::process::id()
+            );
+            log::logger().flush();
+
             // ENG-1377: keep the default Regular activation policy so the app has
             // a Dock icon users can click to open it. Do not set
             // ActivationPolicy::Accessory — tray-only proved too hidden (notched
@@ -230,6 +242,7 @@ pub fn run() {
             commands::get_ws_url,
             commands::get_coding_agent_settings,
             commands::set_coding_agent_settings,
+            diagnostics::open_log_folder,
             commands::get_active_coding_run,
             commands::stop_coding_run,
             commands::open_run_terminal,
