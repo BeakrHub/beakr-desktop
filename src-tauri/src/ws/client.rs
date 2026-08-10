@@ -206,7 +206,12 @@ impl WsClient {
                 // treated as terminal revocation; until then it retries with
                 // the normal backoff.
                 if is_revoked_handshake(&e) {
-                    if handshake_403_is_terminal(consecutive_403s + 1) {
+                    let endpoint_has_succeeded =
+                        crate::config::has_successful_ws_registration(&self.app, &self.ws_url);
+                    if handshake_403_is_terminal(
+                        consecutive_403s + 1,
+                        endpoint_has_succeeded,
+                    ) {
                         log::warn!(
                             "Handshake rejected with 403 Forbidden {} times — device token revoked",
                             consecutive_403s + 1
@@ -287,6 +292,13 @@ impl WsClient {
 
         *self.state.device_id.write().await = Some(device_id.clone());
         self.set_status(ConnectionStatus::Connected).await;
+        if let Err(error) =
+            crate::config::mark_successful_ws_registration(&self.app, &self.ws_url)
+        {
+            // Fail safe: without persisted proof, later handshake failures
+            // remain retryable and can never delete the stored token.
+            log::error!("Could not persist successful WebSocket registration: {error}");
+        }
         log::info!("Connected and registered as device {device_id}");
 
         // Run message loop
@@ -585,8 +597,8 @@ fn is_revoked_handshake(err: &tokio_tungstenite::tungstenite::Error) -> bool {
 
 /// Whether a run of consecutive handshake 403s is long enough to conclude
 /// the token is genuinely revoked rather than the engine being mid-restart.
-fn handshake_403_is_terminal(consecutive_403s: u32) -> bool {
-    consecutive_403s >= REVOKE_403_THRESHOLD
+fn handshake_403_is_terminal(consecutive_403s: u32, endpoint_has_succeeded: bool) -> bool {
+    endpoint_has_succeeded && consecutive_403s >= REVOKE_403_THRESHOLD
 }
 
 /// Whether the WebSocket link should be considered dead, given how long it has
@@ -696,11 +708,20 @@ mod tests {
         // Regression (ENG-1582 bug 4, live 2026-07-17): an engine mid-restart
         // returned one transient 403 and the client destroyed the pairing
         // token of a healthy, active device. A lone 403 must retry.
-        assert!(!handshake_403_is_terminal(1));
-        assert!(!handshake_403_is_terminal(REVOKE_403_THRESHOLD - 1));
+        assert!(!handshake_403_is_terminal(1, true));
+        assert!(!handshake_403_is_terminal(REVOKE_403_THRESHOLD - 1, true));
         // A sustained run of 403s IS revocation — the app must not flap forever.
-        assert!(handshake_403_is_terminal(REVOKE_403_THRESHOLD));
-        assert!(handshake_403_is_terminal(REVOKE_403_THRESHOLD + 3));
+        assert!(handshake_403_is_terminal(REVOKE_403_THRESHOLD, true));
+        assert!(handshake_403_is_terminal(REVOKE_403_THRESHOLD + 3, true));
+    }
+
+    #[test]
+    fn endpoint_that_never_registered_cannot_revoke_the_stored_token() {
+        assert!(!handshake_403_is_terminal(
+            REVOKE_403_THRESHOLD,
+            false
+        ));
+        assert!(handshake_403_is_terminal(REVOKE_403_THRESHOLD, true));
     }
 
     #[test]

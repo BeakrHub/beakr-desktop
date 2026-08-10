@@ -17,6 +17,92 @@ mod ws;
 use state::AppState;
 use tauri_plugin_autostart::MacosLauncher;
 
+/// Windows-only startup gate for the race before Tauri's single-instance
+/// plugin creates its hidden WM_COPYDATA target window.
+///
+/// The upstream plugin sees its mutex, calls `FindWindowW`, and only exits the
+/// duplicate when that window already exists. Four cold launches can all see
+/// the primary's mutex during the gap, miss the window, and continue as four
+/// full applications. This earlier mutex makes contenders wait out that gap;
+/// once the target exists they continue into the plugin's normal focus/handoff
+/// path and exit there.
+#[cfg(target_os = "windows")]
+struct EarlySingleInstanceGuard(isize);
+
+#[cfg(target_os = "windows")]
+impl Drop for EarlySingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0 as _);
+            windows_sys::Win32::Foundation::CloseHandle(self.0 as _);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn early_single_instance_gate() -> Option<EarlySingleInstanceGuard> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, WAIT_ABANDONED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    fn wide(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let gate_name = wide(r"Local\com.thebeakr.desktop-early-single-instance");
+    let handle = unsafe { CreateMutexW(std::ptr::null(), true.into(), gate_name.as_ptr()) };
+    if handle.is_null() {
+        log::error!("Could not create the early single-instance mutex");
+        return None;
+    }
+
+    if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+        return Some(EarlySingleInstanceGuard(handle as isize));
+    }
+
+    // A WebView child can outlive a force-terminated desktop process while
+    // retaining a handle to the named mutex object. Object existence alone
+    // therefore does not prove that another desktop instance is alive. If the
+    // mutex is unowned or abandoned, this launch acquires it and becomes the
+    // new primary.
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => {
+            return Some(EarlySingleInstanceGuard(handle as isize));
+        }
+        WAIT_TIMEOUT => {}
+        result => {
+            log::error!("Could not inspect the early single-instance mutex: {result}");
+            unsafe { CloseHandle(handle) };
+            return None;
+        }
+    }
+
+    unsafe { CloseHandle(handle) };
+    let class_name = wide("com.thebeakr.desktop-sic");
+    let window_name = wide("com.thebeakr.desktop-siw");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let target = unsafe { FindWindowW(class_name.as_ptr(), window_name.as_ptr()) };
+        if !target.is_null() {
+            // Continue into Tauri. The normal single-instance plugin now has a
+            // guaranteed handoff target and will focus the primary then exit.
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    // A process owns the early mutex but never became handoff-ready. Starting
+    // another full tray/WS client would be worse than dropping this launch.
+    std::process::exit(0);
+}
+
 /// Returns the WebSocket URL based on build configuration.
 /// Priority: BEAKR_WS_URL env var (compile-time) > debug=localhost > release=production
 pub fn ws_url() -> String {
@@ -59,6 +145,25 @@ fn launched_by_autostart() -> bool {
 fn autostart_command_is_stale(registered_command: &str, current_exe: &std::path::Path) -> bool {
     let current = current_exe.to_string_lossy().to_lowercase();
     !registered_command.to_lowercase().contains(current.trim())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AutostartStartupPlan {
+    enable_default: bool,
+    mark_default_applied: bool,
+    repair_stale_entry: bool,
+}
+
+fn autostart_startup_plan(
+    default_applied: bool,
+    entry_enabled: bool,
+    entry_is_stale: bool,
+) -> AutostartStartupPlan {
+    AutostartStartupPlan {
+        enable_default: !default_applied && !entry_enabled,
+        mark_default_applied: !default_applied,
+        repair_stale_entry: entry_enabled && entry_is_stale,
+    }
 }
 
 /// Windows: read the launch-at-login entry and report whether it still names
@@ -170,6 +275,9 @@ fn spawn_benchling_liveness(app_handle: tauri::AppHandle, state: AppState) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    let _early_single_instance_guard = early_single_instance_gate();
+
     let app_state = AppState::new();
 
     tauri::Builder::default()
@@ -259,25 +367,48 @@ pub fn run() {
                 });
             }
 
-            // Enable launch-at-login by default so the agent stays available
+            // Enable launch-at-login on the first run only. A missing OS entry
+            // after that is an explicit user preference, not another first run.
             {
                 use tauri_plugin_autostart::ManagerExt;
                 let autostart = app.autolaunch();
-                if !autostart.is_enabled().unwrap_or(false) {
-                    let _ = autostart.enable();
-                    log::info!("Autostart enabled");
-                } else {
-                    // is_enabled() only reports that an entry EXISTS -- not that
-                    // it points at this binary. After a reinstall to a different
-                    // location the entry still names the old path, so login
-                    // silently launches a binary that may no longer be there and
-                    // the agent never comes back. Rewrite it when it is stale.
-                    #[cfg(target_os = "windows")]
-                    if autostart_entry_is_stale() {
-                        log::info!("Autostart entry points elsewhere; rewriting it to this binary");
-                        let _ = autostart.disable();
-                        let _ = autostart.enable();
+                let entry_enabled = autostart.is_enabled().unwrap_or(false);
+                #[cfg(target_os = "windows")]
+                let entry_is_stale = entry_enabled && autostart_entry_is_stale();
+                #[cfg(not(target_os = "windows"))]
+                let entry_is_stale = false;
+                let default_applied = config::autostart_default_applied(app.handle());
+                let plan =
+                    autostart_startup_plan(default_applied, entry_enabled, entry_is_stale);
+
+                let default_succeeded = if plan.enable_default {
+                    match autostart.enable() {
+                        Ok(()) => {
+                            log::info!("Autostart enabled by first-run default");
+                            true
+                        }
+                        Err(error) => {
+                            log::warn!("Failed to apply first-run autostart default: {error}");
+                            false
+                        }
                     }
+                } else {
+                    entry_enabled
+                };
+
+                if plan.mark_default_applied && default_succeeded {
+                    if let Err(error) = config::mark_autostart_default_applied(app.handle()) {
+                        log::warn!("{error}");
+                    }
+                }
+
+                // is_enabled() only reports that an entry EXISTS -- not that
+                // it points at this binary. Preserve stale-install repair even
+                // after the one-time default has been recorded.
+                if plan.repair_stale_entry {
+                    log::info!("Autostart entry points elsewhere; rewriting it to this binary");
+                    let _ = autostart.disable();
+                    let _ = autostart.enable();
                 }
             }
 
@@ -436,7 +567,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod launch_tests {
-    use super::{autostart_command_is_stale, should_open_window_on_launch};
+    use super::{
+        autostart_command_is_stale, autostart_startup_plan, should_open_window_on_launch,
+    };
     use std::path::Path;
 
     #[test]
@@ -487,6 +620,33 @@ mod launch_tests {
             r#""C:\Dev\Beakr\beakr-desktop\src-tauri\target\release\beakr-desktop.exe""#,
             exe
         ));
+    }
+
+    #[test]
+    fn first_run_applies_the_autostart_default_once() {
+        let plan = autostart_startup_plan(false, false, false);
+
+        assert!(plan.enable_default);
+        assert!(plan.mark_default_applied);
+        assert!(!plan.repair_stale_entry);
+    }
+
+    #[test]
+    fn an_absent_entry_stays_absent_after_the_default_was_applied() {
+        let plan = autostart_startup_plan(true, false, false);
+
+        assert!(!plan.enable_default);
+        assert!(!plan.mark_default_applied);
+        assert!(!plan.repair_stale_entry);
+    }
+
+    #[test]
+    fn an_enabled_stale_entry_is_still_repaired_after_the_default() {
+        let plan = autostart_startup_plan(true, true, true);
+
+        assert!(!plan.enable_default);
+        assert!(!plan.mark_default_applied);
+        assert!(plan.repair_stale_entry);
     }
 }
 

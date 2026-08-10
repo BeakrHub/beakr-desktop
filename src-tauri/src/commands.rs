@@ -122,7 +122,7 @@ pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
 pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let autostart = app.autolaunch();
-    if enabled {
+    let result = if enabled {
         autostart
             .enable()
             .map_err(|e| format!("Failed to enable autostart: {e}"))
@@ -130,7 +130,9 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
         autostart
             .disable()
             .map_err(|e| format!("Failed to disable autostart: {e}"))
-    }
+    };
+    result?;
+    crate::config::mark_autostart_default_applied(&app)
 }
 
 /// Get device name.
@@ -315,6 +317,7 @@ pub(crate) async fn clear_device_token(app: &AppHandle, state: &AppState) -> Res
         .store(STORE_FILE)
         .map_err(|e| format!("Failed to open store: {e}"))?;
     let _ = store.delete("device_token");
+    crate::config::clear_successful_ws_registrations(app)?;
 
     // Device is no longer paired — reflect that in the tray menu label.
     crate::tray::update_tray_pairing(app, false);
@@ -329,14 +332,20 @@ pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(
 }
 
 fn store_token(app: &AppHandle, token: &str) -> Result<(), String> {
+    // Registration evidence belongs to the previous credential. Clear it
+    // before storing a replacement so an endpoint that accepted the old token
+    // cannot authorize deletion of a never-used new token.
+    crate::config::clear_successful_ws_registrations(app)?;
     let store = app
         .store(STORE_FILE)
         .map_err(|e| format!("Failed to open store: {e}"))?;
-    let _ = store.set(
+    store.set(
         "device_token",
         serde_json::to_value(token).unwrap_or_default(),
     );
-    Ok(())
+    store
+        .save()
+        .map_err(|error| format!("Failed to persist device token: {error}"))
 }
 
 /// Get the WebSocket URL (so the frontend can determine the environment).

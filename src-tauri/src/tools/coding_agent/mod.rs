@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::process_group::GroupChild;
 use crate::state::{ActiveCodingRun, AppState, CodingRunStatus};
@@ -149,13 +149,38 @@ pub async fn handle_streaming(
         api_key,
     };
 
+    let stdin_prompt = runner.stdin_prompt(&spec).map(str::to_owned);
     let mut cmd = runner.build_command(&binary, &spec);
-    cmd.stdin(std::process::Stdio::null())
+    cmd.stdin(if stdin_prompt.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
     let mut child = GroupChild::spawn(&mut cmd)
         .map_err(|e| format!("spawn_failed: could not start {}: {e}", runner.name()))?;
+    if let Some(prompt) = stdin_prompt {
+        let Some(mut stdin) = child.stdin_take() else {
+            child.kill_group();
+            return Err(format!("spawn_failed: no stdin for {}", runner.name()));
+        };
+        if let Err(error) = stdin.write_all(prompt.as_bytes()).await {
+            child.kill_group();
+            return Err(format!(
+                "spawn_failed: could not send the approved task to {}: {error}",
+                runner.name()
+            ));
+        }
+        if let Err(error) = stdin.shutdown().await {
+            child.kill_group();
+            return Err(format!(
+                "spawn_failed: could not finish sending the approved task to {}: {error}",
+                runner.name()
+            ));
+        }
+    }
     state.processes.register(stream.request_id(), &child);
     // Human-readable live log for the local terminal view. Best-effort: a
     // failure to create it never blocks the run.
