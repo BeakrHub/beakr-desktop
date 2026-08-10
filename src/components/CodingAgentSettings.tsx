@@ -23,7 +23,10 @@ const CLI_META: Record<
   claude: {
     label: "Claude Code",
     installCmd: "npm install -g @anthropic-ai/claude-code",
-    installUrl: "https://claude.ai/code",
+    // claude.ai/code is the product landing page and points people at the
+    // desktop/web app. This panel is only ever shown when the CLI is missing,
+    // so it has to link to CLI setup instructions instead.
+    installUrl: "https://code.claude.com/docs/en/setup",
     loginHint: "Open a terminal, run `claude`, then `/login`.",
   },
   codex: {

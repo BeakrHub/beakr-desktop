@@ -27,11 +27,10 @@ pub async fn set_auth_token(
 /// Start the WebSocket connection to the backend.
 #[tauri::command]
 pub async fn connect_ws(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // Shared with the startup path so both agree on what "already connecting"
+    // means -- see ConnectionStatus::allows_new_client.
     let current = state.ws_status.read().await.clone();
-    if matches!(
-        current,
-        ConnectionStatus::Connected | ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
-    ) {
+    if !current.allows_new_client() {
         return Ok(());
     }
 

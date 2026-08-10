@@ -15,8 +15,6 @@ pub mod unicode;
 mod ws;
 
 use state::AppState;
-#[cfg(target_os = "windows")]
-use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
 
 /// Returns the WebSocket URL based on build configuration.
@@ -32,11 +30,136 @@ pub fn ws_url() -> String {
     }
 }
 
+/// Passed to the app by the launch-at-login entry the autostart plugin writes.
+/// Its only job is to mark a launch as "the OS did this at login", not "a person
+/// opened the app".
+const AUTOSTART_ARG: &str = "--autostart";
+
+/// Whether the settings window should open on this launch.
+///
+/// Two separate reasons to show it:
+///   * not paired yet — the user has nothing else to act on, so the pairing
+///     screen must be reachable without hunting for the tray icon;
+///   * the user launched the app themselves — double-clicking an app and having
+///     nothing appear reads as "it didn't start", which is the complaint that
+///     started this whole investigation.
+///
+/// The one case that stays silent is a paired launch at login, so logging in
+/// doesn't throw a window in the user's face.
+fn should_open_window_on_launch(has_stored_token: bool, launched_by_autostart: bool) -> bool {
+    !has_stored_token || !launched_by_autostart
+}
+
+fn launched_by_autostart() -> bool {
+    std::env::args().any(|arg| arg == AUTOSTART_ARG)
+}
+
+/// Whether a launch-at-login command line refers to some binary other than the
+/// one currently running. Compared case-insensitively because Windows paths are.
+fn autostart_command_is_stale(registered_command: &str, current_exe: &std::path::Path) -> bool {
+    let current = current_exe.to_string_lossy().to_lowercase();
+    !registered_command.to_lowercase().contains(current.trim())
+}
+
+/// Windows: read the launch-at-login entry and report whether it still names
+/// this executable. Any failure to read is treated as "not stale" so a registry
+/// hiccup never causes a pointless rewrite.
+#[cfg(target_os = "windows")]
+fn autostart_entry_is_stale() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_SZ,
+    };
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+
+    unsafe {
+        let mut key = std::ptr::null_mut();
+        let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut key) != 0 {
+            return false;
+        }
+
+        let name = wide("Beakr Desktop");
+        let mut buf = [0u16; 1024];
+        let mut len = (buf.len() * 2) as u32;
+        let rc = RegGetValueW(
+            key,
+            std::ptr::null(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        );
+        RegCloseKey(key);
+        if rc != 0 {
+            return false;
+        }
+
+        let chars = (len as usize / 2).saturating_sub(1);
+        let registered = String::from_utf16_lossy(&buf[..chars]);
+        autostart_command_is_stale(&registered, &exe)
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn should_prevent_exit(exit_code: Option<i32>) -> bool {
     // A window-count/user exit has no code. Explicit app.exit()/restart() calls
     // carry a code and must remain able to terminate the tray application.
     exit_code.is_none()
+}
+
+/// Bring the already-running instance forward when a duplicate launch is blocked.
+///
+/// On Windows this must NOT create the window synchronously. The single-instance
+/// callback runs on the primary's main thread while the second process is still
+/// inside its WM_COPYDATA handoff, and `WebviewWindowBuilder::build()` pumps the
+/// event loop -- creating a window from inside a message handler deadlocks the
+/// primary. Because the primary is then frozen it never acknowledges the
+/// handoff, so the duplicates never exit either: one hung app plus a live
+/// process and tray icon per launch. That is the "several Beakr icons" symptom.
+///
+/// It only bites when there is no window yet, which is precisely the paired
+/// launch-at-login state, and it needs two launches close enough together that
+/// the first has not finished creating the window -- a double-clicked shortcut,
+/// or a shortcut landing at the same moment as autostart.
+///
+/// Deferring to the main-thread queue lets the handoff return first; the closure
+/// then runs on the next turn of the event loop, with no reentrancy.
+fn focus_existing_instance(app: &tauri::AppHandle) {
+    #[cfg(target_os = "windows")]
+    {
+        // run_on_main_thread ALONE is not enough here. This callback already
+        // runs on the main thread, and a main-thread caller can have its
+        // closure executed inline -- which is still inside the handoff, so the
+        // reentrancy remains. Measured: it took the burst failure rate from
+        // 5/5 to 1/5 rather than to 0/5.
+        //
+        // Bouncing through the async runtime first guarantees the handoff has
+        // returned before any window work starts; only then do we come back to
+        // the main thread, which is where window APIs must be called.
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let for_main = handle.clone();
+            let _ = handle.run_on_main_thread(move || {
+                tray::show_settings_window(&for_main);
+            });
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    tray::show_settings_window(app);
 }
 
 fn spawn_benchling_liveness(app_handle: tauri::AppHandle, state: AppState) {
@@ -54,22 +177,7 @@ pub fn run() {
         // plugins initialize. Reuse the tray/Dock window recovery path so the
         // surviving instance is shown, unminimized, and focused.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            tray::show_settings_window(app);
-
-            // On Windows the callback runs synchronously while the secondary
-            // process is still inside its WM_COPYDATA handoff. The first focus
-            // request can be rejected until that foreground-capable process
-            // exits, so retry once after the handoff has returned.
-            #[cfg(target_os = "windows")]
-            {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    if let Some(window) = app.get_webview_window("settings") {
-                        let _ = window.set_focus();
-                    }
-                });
-            }
+            focus_existing_instance(app);
         }))
         // The default targets write both to stdout and to the platform log
         // directory (on Windows: %LOCALAPPDATA%\com.thebeakr.desktop\logs).
@@ -83,9 +191,12 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        // The marker argument is what lets setup() tell a login launch from the
+        // user deliberately opening the app. Without it the two are
+        // indistinguishable and a paired user who double-clicks gets no window.
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            None,
+            Some(vec![AUTOSTART_ARG]),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -155,6 +266,18 @@ pub fn run() {
                 if !autostart.is_enabled().unwrap_or(false) {
                     let _ = autostart.enable();
                     log::info!("Autostart enabled");
+                } else {
+                    // is_enabled() only reports that an entry EXISTS -- not that
+                    // it points at this binary. After a reinstall to a different
+                    // location the entry still names the old path, so login
+                    // silently launches a binary that may no longer be there and
+                    // the agent never comes back. Rewrite it when it is stale.
+                    #[cfg(target_os = "windows")]
+                    if autostart_entry_is_stale() {
+                        log::info!("Autostart entry points elsewhere; rewriting it to this binary");
+                        let _ = autostart.disable();
+                        let _ = autostart.enable();
+                    }
                 }
             }
 
@@ -163,12 +286,10 @@ pub fn run() {
             tray::setup_tray(app.handle())?;
             tray::update_tray_pairing(app.handle(), has_stored_token);
 
-            // First run (no paired device): open the window on launch so a
-            // Finder/Spotlight launch lands on the pairing screen instead of a
-            // Dock icon with no window — macOS fires Reopen only on
-            // RE-activation, never on first launch. Paired launches stay
-            // silent so autostart at login doesn't pop a window.
-            if !has_stored_token {
+            // Open the window unless this is a paired launch at login. See
+            // should_open_window_on_launch. On macOS this also covers the
+            // Finder/Spotlight first-launch case, where Reopen never fires.
+            if should_open_window_on_launch(has_stored_token, launched_by_autostart()) {
                 tray::show_settings_window(app.handle());
             }
 
@@ -199,6 +320,22 @@ pub fn run() {
                     {
                         let ws_app = app_handle.clone();
                         let ws_state = state_clone.clone();
+
+                        // Claim the connection slot BEFORE the delay below.
+                        //
+                        // The settings window can mount during those 500ms and
+                        // call connect_ws. That command refuses to start a
+                        // second client only when the status already says a
+                        // connection is under way -- and until WsClient::run
+                        // actually starts, the status is still Disconnected. So
+                        // the window would slip through and one process would
+                        // run two clients, registering this device twice.
+                        //
+                        // Not platform-gated: the same race exists on macOS,
+                        // where the window opens on first launch and on every
+                        // Dock click.
+                        *ws_state.ws_status.write().await = state::ConnectionStatus::Connecting;
+
                         tauri::async_runtime::spawn(async move {
                             // Brief delay to let state initialization complete
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -295,6 +432,62 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::{autostart_command_is_stale, should_open_window_on_launch};
+    use std::path::Path;
+
+    #[test]
+    fn a_person_opening_the_app_always_gets_a_window() {
+        // The complaint that started ENG-206: double-click, nothing appears.
+        assert!(should_open_window_on_launch(true, false));
+        assert!(should_open_window_on_launch(false, false));
+    }
+
+    #[test]
+    fn a_paired_login_launch_stays_silent() {
+        // Logging in must not throw a window in the user's face.
+        assert!(!should_open_window_on_launch(true, true));
+    }
+
+    #[test]
+    fn an_unpaired_login_launch_still_shows_the_pairing_screen() {
+        // Nothing to act on otherwise, and the tray icon starts hidden in the
+        // Windows 11 overflow, so staying silent would strand the user.
+        assert!(should_open_window_on_launch(false, true));
+    }
+
+    #[test]
+    fn autostart_entry_naming_this_binary_is_not_stale() {
+        let exe = Path::new(r"C:\Users\me\AppData\Local\Beakr Desktop\beakr-desktop.exe");
+        assert!(!autostart_command_is_stale(
+            r#""C:\Users\me\AppData\Local\Beakr Desktop\beakr-desktop.exe" --autostart"#,
+            exe
+        ));
+    }
+
+    #[test]
+    fn autostart_entry_is_case_insensitive_like_windows_paths() {
+        let exe = Path::new(r"C:\Users\me\AppData\Local\Beakr Desktop\beakr-desktop.exe");
+        assert!(!autostart_command_is_stale(
+            r#""c:\users\me\appdata\local\beakr desktop\BEAKR-DESKTOP.EXE" --autostart"#,
+            exe
+        ));
+    }
+
+    #[test]
+    fn autostart_entry_left_by_a_previous_install_location_is_stale() {
+        // Exactly what a reinstall to a different path leaves behind: the entry
+        // survives, points at a binary that may be gone, and login silently
+        // starts nothing.
+        let exe = Path::new(r"C:\Users\me\AppData\Local\Beakr Desktop\beakr-desktop.exe");
+        assert!(autostart_command_is_stale(
+            r#""C:\Dev\Beakr\beakr-desktop\src-tauri\target\release\beakr-desktop.exe""#,
+            exe
+        ));
+    }
 }
 
 #[cfg(all(test, not(target_os = "macos")))]

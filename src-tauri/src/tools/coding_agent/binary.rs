@@ -11,20 +11,38 @@ use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
+/// Every child spawned here is headless — its output is captured and shown in
+/// the app. Without this flag Windows gives each one a console window, which
+/// flashes on screen. It is visible on the readiness check that runs whenever
+/// the settings window opens, so simply opening Beakr flickers a terminal.
+///
+/// Deliberately NOT used by `open_run_terminal`, which wants a real console.
+#[cfg(target_os = "windows")]
+const NO_CONSOLE_WINDOW: u32 =
+    windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
 /// Build a process command for a resolved CLI. npm installs command shims as
 /// `.cmd` files on Windows; CreateProcess cannot execute those directly.
 pub(super) fn command(binary: &Path) -> Command {
     #[cfg(target_os = "windows")]
-    if matches!(
-        binary.extension().and_then(|extension| extension.to_str()),
-        Some(extension) if extension.eq_ignore_ascii_case("cmd")
-            || extension.eq_ignore_ascii_case("bat")
-    ) {
-        let mut command = Command::new("cmd.exe");
-        command.args(["/D", "/S", "/C"]).arg(binary);
+    {
+        let mut command = if matches!(
+            binary.extension().and_then(|extension| extension.to_str()),
+            Some(extension) if extension.eq_ignore_ascii_case("cmd")
+                || extension.eq_ignore_ascii_case("bat")
+        ) {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/S", "/C"]).arg(binary);
+            command
+        } else {
+            Command::new(binary)
+        };
+
+        command.creation_flags(NO_CONSOLE_WINDOW);
         return command;
     }
 
+    #[cfg(not(target_os = "windows"))]
     Command::new(binary)
 }
 

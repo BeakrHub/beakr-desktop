@@ -30,6 +30,25 @@ pub enum ConnectionStatus {
     Revoked,
 }
 
+impl ConnectionStatus {
+    /// Whether a new WebSocket client may be started while in this state.
+    ///
+    /// A client that is merely *connecting* still occupies the slot. Startup
+    /// claims it before its own connect delay, because the settings window can
+    /// mount during that delay and ask to connect; if this returned true for
+    /// `Connecting`, one process would run two clients and register the same
+    /// device twice.
+    ///
+    /// `Revoked` deliberately allows a new client: the user can re-pair without
+    /// restarting the app.
+    pub fn allows_new_client(&self) -> bool {
+        !matches!(
+            self,
+            Self::Connected | Self::Connecting | Self::Reconnecting
+        )
+    }
+}
+
 impl std::fmt::Display for ConnectionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -73,6 +92,33 @@ pub struct ActiveCodingRun {
     /// Absolute path of the run's human-readable live log, when one could be
     /// created — what "Watch in Terminal" tails. None disables that affordance.
     pub log_path: Option<String>,
+}
+
+#[cfg(test)]
+mod connection_status_tests {
+    use super::ConnectionStatus;
+
+    #[test]
+    fn a_connection_already_under_way_blocks_a_second_client() {
+        // The actual defect: startup claims the slot, then the settings window
+        // mounts and asks to connect. Measured before the fix -- one process,
+        // two clients, the device registered twice in a single launch.
+        assert!(!ConnectionStatus::Connecting.allows_new_client());
+        assert!(!ConnectionStatus::Connected.allows_new_client());
+        assert!(!ConnectionStatus::Reconnecting.allows_new_client());
+    }
+
+    #[test]
+    fn a_disconnected_app_can_still_connect() {
+        // Must stay true, or the app can never connect at all.
+        assert!(ConnectionStatus::Disconnected.allows_new_client());
+    }
+
+    #[test]
+    fn a_revoked_device_can_reconnect_after_re_pairing() {
+        // Blocking this would force a restart after re-pairing.
+        assert!(ConnectionStatus::Revoked.allows_new_client());
+    }
 }
 
 /// Shared application state, accessible from commands and the WS client.

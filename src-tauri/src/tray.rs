@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::{
     menu::{MenuBuilder, MenuItem, MenuItemBuilder},
     tray::TrayIconBuilder,
@@ -8,6 +10,11 @@ use crate::state::{ActiveCodingRun, CodingRunStatus, ConnectionStatus};
 
 const WINDOW_LABEL: &str = "settings";
 const WINDOW_TITLE: &str = "Beakr Desktop";
+
+/// Set while the settings window is being built. See the comment at its use
+/// site in `show_settings_window` — window creation pumps the message loop, so
+/// a concurrent request can otherwise start building the same window again.
+static CREATING_SETTINGS_WINDOW: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 fn exit_after_fatal_window_failure(_app: &AppHandle, detail: String) {
@@ -226,6 +233,20 @@ pub fn show_settings_window(app: &AppHandle) {
     #[cfg(target_os = "windows")]
     ensure_webview_runtime_or_exit(app);
 
+    // Building a webview window pumps the platform message loop. That means a
+    // second request to open the window can be delivered and start building the
+    // SAME label while this build is still in flight -- two concurrent builds of
+    // one window, which wedges the main thread. The window does not exist yet at
+    // this point, so the check above cannot catch it; only an explicit
+    // in-progress flag can.
+    //
+    // Reproduced by launching the app three times at once against a paired
+    // instance that has no window yet: without this the app hangs and every
+    // duplicate stays alive with its own tray icon.
+    if CREATING_SETTINGS_WINDOW.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     // Create window — hide on close instead of destroying
     let builder = tauri::WebviewWindowBuilder::new(
         app,
@@ -237,7 +258,12 @@ pub fn show_settings_window(app: &AppHandle) {
     .resizable(true)
     .center();
 
-    match builder.build() {
+    let built = builder.build();
+    // Cleared before handling the result so an error path cannot strand the
+    // flag and permanently prevent the window from ever opening again.
+    CREATING_SETTINGS_WINDOW.store(false, Ordering::SeqCst);
+
+    match built {
         Ok(window) => {
             let window_clone = window.clone();
             window.on_window_event(move |event| {
