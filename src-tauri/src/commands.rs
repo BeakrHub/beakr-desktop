@@ -123,9 +123,7 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let autostart = app.autolaunch();
     let result = if enabled {
-        autostart
-            .enable()
-            .map_err(|e| format!("Failed to enable autostart: {e}"))
+        crate::enable_autostart(&app)
     } else {
         autostart
             .disable()

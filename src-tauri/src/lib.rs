@@ -140,6 +140,28 @@ fn launched_by_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_ARG)
 }
 
+fn autostart_entry_has_marker(registered_entry: &str) -> bool {
+    registered_entry
+        .split(|character: char| {
+            character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>')
+        })
+        .any(|token| token == AUTOSTART_ARG)
+}
+
+fn windows_autostart_command_is_safely_quoted(
+    registered_command: &str,
+    current_exe: &std::path::Path,
+) -> bool {
+    let Some(after_opening_quote) = registered_command.trim_start().strip_prefix('"') else {
+        return false;
+    };
+    let Some((registered_exe, _remaining_args)) = after_opening_quote.split_once('"') else {
+        return false;
+    };
+
+    registered_exe.eq_ignore_ascii_case(&current_exe.to_string_lossy())
+}
+
 /// Whether a launch-at-login command line refers to some binary other than the
 /// one currently running. Compared case-insensitively because Windows paths are.
 fn autostart_command_is_stale(registered_command: &str, current_exe: &std::path::Path) -> bool {
@@ -151,26 +173,29 @@ fn autostart_command_is_stale(registered_command: &str, current_exe: &std::path:
 struct AutostartStartupPlan {
     enable_default: bool,
     mark_default_applied: bool,
-    repair_stale_entry: bool,
+    rewrite_existing_entry: bool,
 }
 
 fn autostart_startup_plan(
     default_applied: bool,
     entry_enabled: bool,
     entry_is_stale: bool,
+    entry_missing_marker: bool,
 ) -> AutostartStartupPlan {
     AutostartStartupPlan {
         enable_default: !default_applied && !entry_enabled,
         mark_default_applied: !default_applied,
-        repair_stale_entry: entry_enabled && entry_is_stale,
+        // The entry must already be enabled. In particular, a missing entry or
+        // one disabled in Windows Startup Apps must never be resurrected by a
+        // migration or repair.
+        rewrite_existing_entry: entry_enabled && (entry_is_stale || entry_missing_marker),
     }
 }
 
-/// Windows: read the launch-at-login entry and report whether it still names
-/// this executable. Any failure to read is treated as "not stale" so a registry
-/// hiccup never causes a pointless rewrite.
+/// Read the platform launch-at-login entry. Any failure is treated as unknown,
+/// so a registry/filesystem hiccup never causes a pointless rewrite.
 #[cfg(target_os = "windows")]
-fn autostart_entry_is_stale() -> bool {
+fn registered_autostart_entry(app_name: &str) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_SZ,
@@ -183,18 +208,14 @@ fn autostart_entry_is_stale() -> bool {
             .collect()
     }
 
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-
     unsafe {
         let mut key = std::ptr::null_mut();
         let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
         if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut key) != 0 {
-            return false;
+            return None;
         }
 
-        let name = wide("Beakr Desktop");
+        let name = wide(app_name);
         let mut buf = [0u16; 1024];
         let mut len = (buf.len() * 2) as u32;
         let rc = RegGetValueW(
@@ -208,13 +229,186 @@ fn autostart_entry_is_stale() -> bool {
         );
         RegCloseKey(key);
         if rc != 0 {
-            return false;
+            return None;
         }
 
         let chars = (len as usize / 2).saturating_sub(1);
-        let registered = String::from_utf16_lossy(&buf[..chars]);
-        autostart_command_is_stale(&registered, &exe)
+        Some(String::from_utf16_lossy(&buf[..chars]))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn registered_autostart_entry(app_name: &str) -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    std::fs::read_to_string(
+        std::path::PathBuf::from(home)
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{app_name}.plist")),
+    )
+    .ok()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn registered_autostart_entry(_app_name: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn write_safely_quoted_windows_autostart_entry(app_name: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
+    };
+
+    fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("Failed to resolve the current executable: {error}"))?;
+    let command = format!("\"{}\" {AUTOSTART_ARG}", exe.display());
+    let subkey = wide(std::ffi::OsStr::new(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+    ));
+    let name = wide(std::ffi::OsStr::new(app_name));
+    let value = wide(std::ffi::OsStr::new(&command));
+
+    unsafe {
+        let mut key = std::ptr::null_mut();
+        let open_result = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut key,
+        );
+        if open_result != 0 {
+            return Err(format!("Failed to open the Windows Run key: {open_result}"));
+        }
+
+        let write_result = RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_SZ,
+            value.as_ptr().cast(),
+            (value.len() * std::mem::size_of::<u16>()) as u32,
+        );
+        RegCloseKey(key);
+        if write_result != 0 {
+            return Err(format!(
+                "Failed to write the safely quoted Windows Run entry: {write_result}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn remove_synthetic_windows_startup_approval(app_name: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_SET_VALUE,
+    };
+
+    fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let subkey = wide(std::ffi::OsStr::new(
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+    ));
+    let name = wide(std::ffi::OsStr::new(app_name));
+
+    unsafe {
+        let mut key = std::ptr::null_mut();
+        let open_result = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut key,
+        );
+        if open_result == ERROR_FILE_NOT_FOUND {
+            return Ok(());
+        }
+        if open_result != 0 {
+            return Err(format!(
+                "Failed to open the Windows StartupApproved key: {open_result}"
+            ));
+        }
+
+        let delete_result = RegDeleteValueW(key, name.as_ptr());
+        RegCloseKey(key);
+        if delete_result != 0 && delete_result != ERROR_FILE_NOT_FOUND {
+            return Err(format!(
+                "Failed to remove the synthetic Windows startup approval: {delete_result}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn enable_autostart(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+
+    app.autolaunch()
+        .enable()
+        .map_err(|error| format!("Failed to enable autostart: {error}"))?;
+
+    // auto-launch 0.5.0 writes the Windows executable path without quotes and
+    // fabricates a StartupApproved value. The former is hijackable; the latter
+    // is filtered out by Shell-Core on the affected Windows 11 build even
+    // though Settings displays it as enabled. Absence means enabled to both
+    // Windows and auto-launch. This function is called only for an explicit
+    // enable or an entry already known to be enabled, so a real user-disabled
+    // StartupApproved value is never removed here.
+    #[cfg(target_os = "windows")]
+    {
+        write_safely_quoted_windows_autostart_entry(&app.package_info().name)?;
+        remove_synthetic_windows_startup_approval(&app.package_info().name)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn record_early_startup_probe() {
+    use std::io::Write;
+
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let log_dir = std::path::PathBuf::from(local_app_data)
+        .join("com.thebeakr.desktop")
+        .join("logs");
+    if std::fs::create_dir_all(&log_dir).is_err() {
+        return;
+    }
+    let path = log_dir.join("startup-probe.log");
+    let truncate = std::fs::metadata(&path)
+        .map(|metadata| metadata.len() > 64 * 1024)
+        .unwrap_or(false);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(!truncate)
+        .truncate(truncate)
+        .open(path);
+    let Ok(mut file) = file else {
+        return;
+    };
+    let _ = writeln!(
+        file,
+        "{} pid={} autostart_marker={}",
+        chrono::Local::now().to_rfc3339(),
+        std::process::id(),
+        launched_by_autostart()
+    );
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -275,6 +469,9 @@ fn spawn_benchling_liveness(app_handle: tauri::AppHandle, state: AppState) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    record_early_startup_probe();
+
     #[cfg(target_os = "windows")]
     let _early_single_instance_guard = early_single_instance_gate();
 
@@ -373,16 +570,47 @@ pub fn run() {
                 use tauri_plugin_autostart::ManagerExt;
                 let autostart = app.autolaunch();
                 let entry_enabled = autostart.is_enabled().unwrap_or(false);
+                let registered_entry = if entry_enabled {
+                    registered_autostart_entry(&app.package_info().name)
+                } else {
+                    None
+                };
                 #[cfg(target_os = "windows")]
-                let entry_is_stale = entry_enabled && autostart_entry_is_stale();
+                let entry_is_stale = registered_entry
+                    .as_deref()
+                    .and_then(|registered| {
+                        std::env::current_exe()
+                            .ok()
+                            .map(|exe| autostart_command_is_stale(registered, &exe))
+                    })
+                    .unwrap_or(false);
                 #[cfg(not(target_os = "windows"))]
                 let entry_is_stale = false;
+                let entry_missing_marker = registered_entry
+                    .as_deref()
+                    .map(|registered| !autostart_entry_has_marker(registered))
+                    .unwrap_or(false);
+                #[cfg(target_os = "windows")]
+                let entry_needs_safe_quote = registered_entry
+                    .as_deref()
+                    .and_then(|registered| {
+                        std::env::current_exe().ok().map(|exe| {
+                            !windows_autostart_command_is_safely_quoted(registered, &exe)
+                        })
+                    })
+                    .unwrap_or(false);
+                #[cfg(not(target_os = "windows"))]
+                let entry_needs_safe_quote = false;
                 let default_applied = config::autostart_default_applied(app.handle());
-                let plan =
-                    autostart_startup_plan(default_applied, entry_enabled, entry_is_stale);
+                let plan = autostart_startup_plan(
+                    default_applied,
+                    entry_enabled,
+                    entry_is_stale,
+                    entry_missing_marker || entry_needs_safe_quote,
+                );
 
                 let default_succeeded = if plan.enable_default {
-                    match autostart.enable() {
+                    match enable_autostart(app.handle()) {
                         Ok(()) => {
                             log::info!("Autostart enabled by first-run default");
                             true
@@ -405,10 +633,13 @@ pub fn run() {
                 // is_enabled() only reports that an entry EXISTS -- not that
                 // it points at this binary. Preserve stale-install repair even
                 // after the one-time default has been recorded.
-                if plan.repair_stale_entry {
-                    log::info!("Autostart entry points elsewhere; rewriting it to this binary");
-                    let _ = autostart.disable();
-                    let _ = autostart.enable();
+                if plan.rewrite_existing_entry {
+                    log::info!(
+                        "Rewriting enabled autostart entry (stale={entry_is_stale}, missing_marker={entry_missing_marker}, unsafe_windows_command={entry_needs_safe_quote})"
+                    );
+                    if let Err(error) = enable_autostart(app.handle()) {
+                        log::warn!("Failed to rewrite autostart entry: {error}");
+                    }
                 }
             }
 
@@ -568,7 +799,8 @@ pub fn run() {
 #[cfg(test)]
 mod launch_tests {
     use super::{
-        autostart_command_is_stale, autostart_startup_plan, should_open_window_on_launch,
+        autostart_command_is_stale, autostart_entry_has_marker, autostart_startup_plan,
+        should_open_window_on_launch, windows_autostart_command_is_safely_quoted,
     };
     use std::path::Path;
 
@@ -623,30 +855,65 @@ mod launch_tests {
     }
 
     #[test]
+    fn windows_autostart_command_quotes_the_executable_as_the_first_argument() {
+        let exe = Path::new(r"C:\Users\me\AppData\Local\Beakr Desktop\beakr-desktop.exe");
+        assert!(windows_autostart_command_is_safely_quoted(
+            r#""C:\Users\me\AppData\Local\Beakr Desktop\beakr-desktop.exe" --autostart"#,
+            exe
+        ));
+        assert!(!windows_autostart_command_is_safely_quoted(
+            r#"C:\Users\me\AppData\Local\Beakr Desktop\beakr-desktop.exe --autostart"#,
+            exe
+        ));
+    }
+
+    #[test]
+    fn autostart_marker_is_detected_in_windows_and_macos_entries() {
+        assert!(autostart_entry_has_marker(
+            r#""C:\Program Files\Beakr\beakr-desktop.exe" --autostart"#
+        ));
+        assert!(autostart_entry_has_marker(
+            "<array><string>/Applications/Beakr Desktop.app/Contents/MacOS/beakr-desktop</string><string>--autostart</string></array>"
+        ));
+        assert!(!autostart_entry_has_marker(
+            r#""C:\Program Files\Beakr\beakr-desktop.exe""#
+        ));
+    }
+
+    #[test]
     fn first_run_applies_the_autostart_default_once() {
-        let plan = autostart_startup_plan(false, false, false);
+        let plan = autostart_startup_plan(false, false, false, false);
 
         assert!(plan.enable_default);
         assert!(plan.mark_default_applied);
-        assert!(!plan.repair_stale_entry);
+        assert!(!plan.rewrite_existing_entry);
     }
 
     #[test]
     fn an_absent_entry_stays_absent_after_the_default_was_applied() {
-        let plan = autostart_startup_plan(true, false, false);
+        let plan = autostart_startup_plan(true, false, false, true);
 
         assert!(!plan.enable_default);
         assert!(!plan.mark_default_applied);
-        assert!(!plan.repair_stale_entry);
+        assert!(!plan.rewrite_existing_entry);
     }
 
     #[test]
     fn an_enabled_stale_entry_is_still_repaired_after_the_default() {
-        let plan = autostart_startup_plan(true, true, true);
+        let plan = autostart_startup_plan(true, true, true, false);
 
         assert!(!plan.enable_default);
         assert!(!plan.mark_default_applied);
-        assert!(plan.repair_stale_entry);
+        assert!(plan.rewrite_existing_entry);
+    }
+
+    #[test]
+    fn an_enabled_legacy_entry_without_the_marker_is_rewritten() {
+        let plan = autostart_startup_plan(true, true, false, true);
+
+        assert!(!plan.enable_default);
+        assert!(!plan.mark_default_applied);
+        assert!(plan.rewrite_existing_entry);
     }
 }
 
