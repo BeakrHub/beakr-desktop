@@ -103,6 +103,135 @@ fn early_single_instance_gate() -> Option<EarlySingleInstanceGuard> {
     std::process::exit(0);
 }
 
+/// macOS-only gate for the Unix-socket claim race in
+/// tauri-plugin-single-instance 2.4.3.
+///
+/// The plugin deletes its socket after either `NotFound` or
+/// `ConnectionRefused`, then starts its listener asynchronously. Concurrent
+/// cold starters can therefore all delete the path and all continue as the
+/// primary. An advisory lock is claimed before Tauri starts. The primary holds
+/// it for its full lifetime; contenders wait for the plugin socket, perform
+/// the plugin's normal handoff protocol, and exit. `flock` is released by the
+/// kernel even after SIGKILL, so a dead primary cannot strand future launches.
+#[cfg(target_os = "macos")]
+struct EarlyMacSingleInstanceGuard {
+    _lock_file: std::fs::File,
+}
+
+#[cfg(target_os = "macos")]
+fn try_lock_macos_single_instance(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn notify_macos_singleton(socket: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let stream = UnixStream::connect(socket)?;
+    let mut writer = std::io::BufWriter::new(&stream);
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap_or_default()
+        .to_string();
+    writer.write_all(cwd.as_bytes())?;
+    writer.write_all(b"\0\0")?;
+    let args = std::env::args().collect::<Vec<_>>().join("\0");
+    writer.write_all(args.as_bytes())?;
+    writer.flush()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn early_macos_single_instance_gate() -> Option<EarlyMacSingleInstanceGuard> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // The upstream plugin uses this identifier-derived path when its optional
+    // semver feature is disabled (as it is in this application).
+    let socket = std::path::Path::new("/tmp/com_thebeakr_desktop_si.sock");
+    let lock_path = format!("/tmp/com_thebeakr_desktop_{}_si.lock", unsafe {
+        libc::getuid()
+    });
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("Could not open the early macOS single-instance lock: {error}");
+            return None;
+        }
+    };
+
+    match try_lock_macos_single_instance(&file) {
+        Ok(true) => {
+            return Some(EarlyMacSingleInstanceGuard { _lock_file: file });
+        }
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("Could not inspect the early macOS single-instance lock: {error}");
+            return None;
+        }
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match notify_macos_singleton(socket) {
+            Ok(()) => std::process::exit(0),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            Err(error) => {
+                eprintln!("Could not notify the primary macOS instance: {error}");
+                std::process::exit(0);
+            }
+        }
+
+        // The previous owner may have died before its socket became ready.
+        // Reclaiming the kernel lock lets this contender become the primary;
+        // the plugin will remove any stale socket in its normal setup path.
+        match try_lock_macos_single_instance(&file) {
+            Ok(true) => {
+                return Some(EarlyMacSingleInstanceGuard { _lock_file: file });
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("Could not recheck the early macOS single-instance lock: {error}");
+                std::process::exit(0);
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            // Another process is alive but never became handoff-ready. Starting
+            // a second tray and WebSocket client would be the worse failure.
+            std::process::exit(0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Returns the WebSocket URL based on build configuration.
 /// Priority: BEAKR_WS_URL env var (compile-time) > debug=localhost > release=production
 pub fn ws_url() -> String {
@@ -475,6 +604,9 @@ pub fn run() {
     #[cfg(target_os = "windows")]
     let _early_single_instance_guard = early_single_instance_gate();
 
+    #[cfg(target_os = "macos")]
+    let _early_macos_single_instance_guard = early_macos_single_instance_gate();
+
     let app_state = AppState::new();
 
     tauri::Builder::default()
@@ -803,6 +935,32 @@ mod launch_tests {
         should_open_window_on_launch, windows_autostart_command_is_safely_quoted,
     };
     use std::path::Path;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_single_instance_lock_is_exclusive_and_recoverable() {
+        use super::try_lock_macos_single_instance;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("single-instance.lock");
+        let primary = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        assert!(try_lock_macos_single_instance(&primary).unwrap());
+        assert!(!try_lock_macos_single_instance(&contender).unwrap());
+
+        drop(primary);
+        assert!(try_lock_macos_single_instance(&contender).unwrap());
+    }
 
     #[test]
     fn a_person_opening_the_app_always_gets_a_window() {
