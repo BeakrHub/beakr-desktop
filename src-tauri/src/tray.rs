@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::{
     menu::{MenuBuilder, MenuItem, MenuItemBuilder},
     tray::TrayIconBuilder,
@@ -9,6 +11,82 @@ use crate::state::{ActiveCodingRun, CodingRunStatus, ConnectionStatus};
 const WINDOW_LABEL: &str = "settings";
 const WINDOW_TITLE: &str = "Beakr Desktop";
 
+/// Set while the settings window is being built. See the comment at its use
+/// site in `show_settings_window` — window creation pumps the message loop, so
+/// a concurrent request can otherwise start building the same window again.
+static CREATING_SETTINGS_WINDOW: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
+fn exit_after_fatal_window_failure(_app: &AppHandle, detail: String) {
+    // Reached from the startup preflight as well as from window creation, so
+    // the message must not claim a window was being created.
+    log::error!("Fatal: the app cannot show any UI. {detail}");
+    log::logger().flush();
+
+    // Tauri's graceful exit request is intentionally intercepted to keep the
+    // Windows tray app resident. This failure is unrecoverable, so terminate
+    // with an explicit status after the diagnostic record is durable.
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "windows")]
+const WEBVIEW2_MISSING_MESSAGE: &str = "Could not find the WebView2 Runtime.\n\nMake sure it is installed or download it from https://developer.microsoft.com/en-us/microsoft-edge/webview2\n\nYou may have it installed on another user account, but it is not available for this one.";
+
+/// Windows: confirm the WebView2 runtime is usable, or terminate.
+///
+/// Must be called from `setup()` before any background task starts. Without a
+/// runtime, a webview call panics on whichever worker thread makes it — and a
+/// panic on a tokio worker kills only that task, not the process. The agent
+/// then keeps running with no UI and still registers with the backend as a
+/// healthy device, so the user sees "connected" and nothing they can click.
+/// Checking here, before anything can make that call, is what makes the
+/// failure fatal instead of silent.
+#[cfg(target_os = "windows")]
+pub fn ensure_webview_runtime_or_exit(app: &AppHandle) {
+    let Some(error) = windows_webview_runtime_error() else {
+        return;
+    };
+
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    app.dialog()
+        .message(WEBVIEW2_MISSING_MESSAGE)
+        .title("Error")
+        .kind(MessageDialogKind::Error)
+        .blocking_show();
+    exit_after_fatal_window_failure(app, error);
+}
+
+#[cfg(target_os = "windows")]
+fn windows_webview_runtime_error() -> Option<String> {
+    if let Some(configured_folder) = std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") {
+        let configured_folder = std::path::PathBuf::from(configured_folder);
+        if !configured_folder.is_dir() {
+            return Some(format!(
+                "configured WebView2 folder is unavailable: {}",
+                configured_folder.display()
+            ));
+        }
+    }
+
+    tauri::webview_version()
+        .err()
+        .map(|e| format!("WebView2 runtime is unavailable: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_tray_open_gesture(
+    button: tauri::tray::MouseButton,
+    button_state: tauri::tray::MouseButtonState,
+) -> bool {
+    matches!(
+        (button, button_state),
+        (
+            tauri::tray::MouseButton::Left,
+            tauri::tray::MouseButtonState::Up
+        )
+    )
+}
+
 /// Holds the tray menu items whose text we update at runtime.
 pub struct TrayState {
     pub status_item: MenuItem<tauri::Wry>,
@@ -17,7 +95,7 @@ pub struct TrayState {
     /// which SIGINTs the CLI's process group.
     pub stop_run_item: MenuItem<tauri::Wry>,
     /// "Watch coding run in Terminal" — enabled while an active run has a
-    /// live log; clicking opens Terminal.app tailing it.
+    /// live log; clicking opens the platform terminal tailing it.
     pub watch_run_item: MenuItem<tauri::Wry>,
     /// Opens the app/pairing window. Its label is state-aware: "Pair device"
     /// when no device is paired (it lands on the pairing screen) and "Open Beakr"
@@ -35,6 +113,8 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // Default to the unpaired label; lib.rs updates it from the stored token at
     // startup, and claim_pairing_code/clear_token update it as pairing changes.
     let settings_item = MenuItemBuilder::with_id("settings", "Pair device").build(app)?;
+
+    let open_logs_item = MenuItemBuilder::with_id("open_logs", "Open log folder").build(app)?;
 
     let stop_run_item = MenuItemBuilder::with_id("stop_run", "Stop coding run")
         .enabled(false)
@@ -58,19 +138,41 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .item(&status_item)
         .separator()
         .item(&settings_item)
+        .item(&open_logs_item)
         .item(&watch_run_item)
         .item(&stop_run_item)
         .separator()
         .item(&quit_item)
         .build()?;
 
-    let _tray = TrayIconBuilder::new()
+    let tray_builder = TrayIconBuilder::new()
         .icon(app.default_window_icon().cloned().unwrap())
         .menu(&menu)
-        .tooltip("Beakr Desktop")
+        .tooltip("Beakr Desktop");
+
+    #[cfg(target_os = "windows")]
+    let tray_builder = tray_builder.on_tray_icon_event(|tray, event| {
+        if let tauri::tray::TrayIconEvent::Click {
+            button,
+            button_state,
+            ..
+        } = event
+        {
+            if is_windows_tray_open_gesture(button, button_state) {
+                show_settings_window(tray.app_handle());
+            }
+        }
+    });
+
+    let _tray = tray_builder
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "settings" => {
                 show_settings_window(app);
+            }
+            "open_logs" => {
+                if let Err(error) = crate::diagnostics::open_log_folder(app.clone()) {
+                    log::error!("Could not open log folder: {error}");
+                }
             }
             "stop_run" => {
                 if let Some(state) = app.try_state::<crate::state::AppState>() {
@@ -125,6 +227,26 @@ pub fn show_settings_window(app: &AppHandle) {
         return;
     }
 
+    // Normally a no-op: setup() already ran this before anything started. It
+    // stays here because the runtime can be uninstalled while the agent is
+    // resident, and this is the next moment we would otherwise touch it.
+    #[cfg(target_os = "windows")]
+    ensure_webview_runtime_or_exit(app);
+
+    // Building a webview window pumps the platform message loop. That means a
+    // second request to open the window can be delivered and start building the
+    // SAME label while this build is still in flight -- two concurrent builds of
+    // one window, which wedges the main thread. The window does not exist yet at
+    // this point, so the check above cannot catch it; only an explicit
+    // in-progress flag can.
+    //
+    // Reproduced by launching the app three times at once against a paired
+    // instance that has no window yet: without this the app hangs and every
+    // duplicate stays alive with its own tray icon.
+    if CREATING_SETTINGS_WINDOW.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     // Create window — hide on close instead of destroying
     let builder = tauri::WebviewWindowBuilder::new(
         app,
@@ -136,7 +258,12 @@ pub fn show_settings_window(app: &AppHandle) {
     .resizable(true)
     .center();
 
-    match builder.build() {
+    let built = builder.build();
+    // Cleared before handling the result so an error path cannot strand the
+    // flag and permanently prevent the window from ever opening again.
+    CREATING_SETTINGS_WINDOW.store(false, Ordering::SeqCst);
+
+    match built {
         Ok(window) => {
             let window_clone = window.clone();
             window.on_window_event(move |event| {
@@ -147,6 +274,14 @@ pub fn show_settings_window(app: &AppHandle) {
             });
         }
         Err(e) => {
+            // A Windows agent without a usable WebView2 runtime can never
+            // present pairing, status, or recovery UI. Do not remain in the
+            // background looking healthy; the native runtime dialog already
+            // explained the problem, and the file logger preserves the cause.
+            #[cfg(target_os = "windows")]
+            exit_after_fatal_window_failure(app, e.to_string());
+
+            #[cfg(not(target_os = "windows"))]
             log::error!("Failed to create settings window: {e}");
         }
     }
@@ -212,6 +347,50 @@ pub fn update_tray_coding_run(app: &AppHandle, run: Option<&ActiveCodingRun>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_primary_tray_release_is_the_open_window_gesture() {
+        use tauri::tray::{MouseButton, MouseButtonState};
+
+        assert!(is_windows_tray_open_gesture(
+            MouseButton::Left,
+            MouseButtonState::Up
+        ));
+        assert!(!is_windows_tray_open_gesture(
+            MouseButton::Left,
+            MouseButtonState::Down
+        ));
+        assert!(!is_windows_tray_open_gesture(
+            MouseButton::Right,
+            MouseButtonState::Up
+        ));
+    }
+
+    /// ENG-1953. The check itself was already correct; the defect was that it
+    /// only ran from `show_settings_window`, which a paired launch never calls.
+    /// This pins the detector that the startup preflight now relies on.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unusable_webview2_folder_is_reported_as_a_runtime_error() {
+        let bogus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("no-such-webview2-runtime-dir");
+        assert!(!bogus.is_dir(), "fixture path must not exist");
+
+        let previous = std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
+        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &bogus);
+        let detected = windows_webview_runtime_error();
+        match previous {
+            Some(v) => std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", v),
+            None => std::env::remove_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER"),
+        }
+
+        let detected = detected.expect("a missing WebView2 folder must be a fatal runtime error");
+        assert!(
+            detected.contains("unavailable"),
+            "error should name the unavailable folder, got: {detected}"
+        );
+    }
 
     fn run(status: CodingRunStatus) -> ActiveCodingRun {
         ActiveCodingRun {

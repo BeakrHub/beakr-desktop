@@ -25,6 +25,7 @@ use std::path::Path;
 
 use tokio::process::Command;
 
+use super::binary;
 use super::runner::{Chunk, LocalCodingRunner, ParsedLine, RunResult, RunSpec};
 
 pub struct CodexRunner;
@@ -99,8 +100,11 @@ impl LocalCodingRunner for CodexRunner {
         // parent `exec` level BEFORE the subcommand — where they then apply
         // to the resumed turn. Canonical shape (works for fresh and resume):
         //   codex exec --json --sandbox workspace-write --skip-git-repo-check
-        //     --cd <dir> [resume <thread_id>] -- <prompt>
-        let mut cmd = Command::new(binary);
+        //     --cd <dir> [resume <thread_id>] -- -
+        // The prompt is written to stdin. This is required on Windows because
+        // the npm-installed codex.cmd shim is run through cmd.exe, which
+        // reparses multiline argv and can silently drop the approved task.
+        let mut cmd = binary::command(binary);
         cmd.current_dir(&spec.working_dir);
         cmd.arg("exec")
             .arg("--json")
@@ -111,11 +115,15 @@ impl LocalCodingRunner for CodexRunner {
         if let Some(session) = &spec.session_id {
             cmd.args(["resume", session]);
         }
-        // Prompt last: positional, after every flag.
-        cmd.arg("--").arg(&spec.prompt);
+        // `-` is Codex's documented stdin-prompt positional.
+        cmd.arg("--").arg("-");
         // spec.api_key is the user's ANTHROPIC key for the Claude adapter —
         // never injected here. Codex uses its own `codex login` credential.
         cmd
+    }
+
+    fn stdin_prompt<'a>(&self, spec: &'a RunSpec) -> Option<&'a str> {
+        Some(&spec.prompt)
     }
 
     fn parse_line(&self, line: &str) -> ParsedLine {
@@ -259,7 +267,7 @@ impl LocalCodingRunner for CodexRunner {
             || lower.contains("authentication")
         {
             return format!(
-                "auth_failed: Codex isn't logged in on this Mac. Run `codex login` in a \
+                "auth_failed: Codex isn't logged in on this computer. Run `codex login` in a \
                  terminal and try again. ({stderr_tail})"
             );
         }
@@ -471,10 +479,32 @@ mod tests {
             let pos = args.iter().position(|a| a == flag).unwrap_or_else(|| panic!("{flag} missing"));
             assert!(pos < resume_pos, "{flag} must precede the resume subcommand");
         }
-        assert_eq!(args.last().unwrap(), "continue");
+        assert_eq!(args.last().unwrap(), "-");
         // The user's Anthropic key is Claude-only; Codex uses its own login.
         assert!(!std_cmd
             .get_envs()
             .any(|(k, _)| k.to_string_lossy() == "ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn multiline_prompt_uses_stdin_instead_of_cmd_shim_argv() {
+        let prompt = "First run Start-Sleep -Seconds 55.\nThen read control-readable.md.\nReport CANARY-1997.";
+        let spec = RunSpec {
+            prompt: prompt.into(),
+            working_dir: "C:\\Dev\\beakr-adversarial".into(),
+            session_id: None,
+            api_key: None,
+        };
+
+        let cmd = CodexRunner.build_command(Path::new("codex.cmd"), &spec);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+        assert!(!args.iter().any(|arg| arg.contains("Start-Sleep")));
+        assert_eq!(CodexRunner.stdin_prompt(&spec), Some(prompt));
     }
 }

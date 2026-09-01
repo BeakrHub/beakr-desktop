@@ -3,6 +3,8 @@ use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
 const STORE_FILE: &str = "settings.json";
+const AUTOSTART_DEFAULT_APPLIED_KEY: &str = "autostart_default_applied";
+const SUCCESSFUL_WS_URLS_KEY: &str = "successful_ws_registration_urls";
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -76,6 +78,76 @@ pub fn load_settings(app: &AppHandle) -> Settings {
         claude_auth_ok,
         codex_auth_ok,
     }
+}
+
+pub fn autostart_default_applied(app: &AppHandle) -> bool {
+    app.store(STORE_FILE)
+        .ok()
+        .and_then(|store| store.get(AUTOSTART_DEFAULT_APPLIED_KEY))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+/// Persist that the launch-at-login default has already been applied. Save
+/// synchronously so an immediate quit cannot lose an explicit disable.
+pub fn mark_autostart_default_applied(app: &AppHandle) -> Result<(), String> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|error| format!("Failed to open settings store: {error}"))?;
+    store.set(
+        AUTOSTART_DEFAULT_APPLIED_KEY,
+        serde_json::Value::Bool(true),
+    );
+    store
+        .save()
+        .map_err(|error| format!("Failed to persist autostart preference: {error}"))
+}
+
+/// Whether the current pairing token has ever completed registration against
+/// this exact WebSocket endpoint. The URL list is cleared whenever the token
+/// changes, so success by an old pairing cannot authorize deletion of a new
+/// token after handshake failures.
+pub fn has_successful_ws_registration(app: &AppHandle, ws_url: &str) -> bool {
+    app.store(STORE_FILE)
+        .ok()
+        .and_then(|store| store.get(SUCCESSFUL_WS_URLS_KEY))
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .is_some_and(|urls| urls.iter().any(|url| url == ws_url))
+}
+
+/// Persist proof that the current token completed the server's `registered`
+/// handshake at this endpoint.
+pub fn mark_successful_ws_registration(app: &AppHandle, ws_url: &str) -> Result<(), String> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|error| format!("Failed to open settings store: {error}"))?;
+    let mut urls = store
+        .get(SUCCESSFUL_WS_URLS_KEY)
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .unwrap_or_default();
+    if !urls.iter().any(|url| url == ws_url) {
+        urls.push(ws_url.to_string());
+        store.set(
+            SUCCESSFUL_WS_URLS_KEY,
+            serde_json::to_value(urls).unwrap_or_default(),
+        );
+        store
+            .save()
+            .map_err(|error| format!("Failed to persist WebSocket registration proof: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Reset endpoint-success proof when a token is stored or cleared. Success is
+/// evidence about one credential, not the machine forever.
+pub fn clear_successful_ws_registrations(app: &AppHandle) -> Result<(), String> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|error| format!("Failed to open settings store: {error}"))?;
+    store.delete(SUCCESSFUL_WS_URLS_KEY);
+    store
+        .save()
+        .map_err(|error| format!("Failed to clear WebSocket registration proof: {error}"))
 }
 
 /// Record the auth outcome of a real run (success -> true, auth_failed ->

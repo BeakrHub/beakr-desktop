@@ -61,8 +61,19 @@ jobs:
       - name: Cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --all-targets
 
-      # Unix-only: the test suite covers the process-group/pgid paths that do
-      # not exist on Windows, and Windows has no runner-side equivalent yet.
       - name: Cargo test
-        if: matrix.os == 'macos-latest'
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      # A release-profile paired launch has different window/exit behavior from
+      # debug builds. Compile it against an unreachable loopback endpoint so the
+      # synthetic CI token can never reach or mutate a real Beakr environment.
+      - name: Build paired release smoke binary
+        if: matrix.os == 'windows-latest'
+        env:
+          BEAKR_WS_URL: ws://127.0.0.1:9/v1/desktop-agent/ws
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release
+
+      - name: Paired release stays alive
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: ./scripts/test-windows-ci-paired-lifetime.ps1

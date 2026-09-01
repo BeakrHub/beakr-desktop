@@ -27,11 +27,10 @@ pub async fn set_auth_token(
 /// Start the WebSocket connection to the backend.
 #[tauri::command]
 pub async fn connect_ws(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // Shared with the startup path so both agree on what "already connecting"
+    // means -- see ConnectionStatus::allows_new_client.
     let current = state.ws_status.read().await.clone();
-    if matches!(
-        current,
-        ConnectionStatus::Connected | ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
-    ) {
+    if !current.allows_new_client() {
         return Ok(());
     }
 
@@ -123,15 +122,15 @@ pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
 pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let autostart = app.autolaunch();
-    if enabled {
-        autostart
-            .enable()
-            .map_err(|e| format!("Failed to enable autostart: {e}"))
+    let result = if enabled {
+        crate::enable_autostart(&app)
     } else {
         autostart
             .disable()
             .map_err(|e| format!("Failed to disable autostart: {e}"))
-    }
+    };
+    result?;
+    crate::config::mark_autostart_default_applied(&app)
 }
 
 /// Get device name.
@@ -316,6 +315,7 @@ pub(crate) async fn clear_device_token(app: &AppHandle, state: &AppState) -> Res
         .store(STORE_FILE)
         .map_err(|e| format!("Failed to open store: {e}"))?;
     let _ = store.delete("device_token");
+    crate::config::clear_successful_ws_registrations(app)?;
 
     // Device is no longer paired — reflect that in the tray menu label.
     crate::tray::update_tray_pairing(app, false);
@@ -330,14 +330,20 @@ pub async fn clear_token(app: AppHandle, state: State<'_, AppState>) -> Result<(
 }
 
 fn store_token(app: &AppHandle, token: &str) -> Result<(), String> {
+    // Registration evidence belongs to the previous credential. Clear it
+    // before storing a replacement so an endpoint that accepted the old token
+    // cannot authorize deletion of a never-used new token.
+    crate::config::clear_successful_ws_registrations(app)?;
     let store = app
         .store(STORE_FILE)
         .map_err(|e| format!("Failed to open store: {e}"))?;
-    let _ = store.set(
+    store.set(
         "device_token",
         serde_json::to_value(token).unwrap_or_default(),
     );
-    Ok(())
+    store
+        .save()
+        .map_err(|error| format!("Failed to persist device token: {error}"))
 }
 
 /// Get the WebSocket URL (so the frontend can determine the environment).
@@ -478,7 +484,7 @@ pub fn stop_coding_run(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(crate::state::stop_active_coding_run(&state).is_some())
 }
 
-/// Open Terminal.app tailing the active coding run's live log — the local
+/// Open the platform terminal tailing the active coding run's live log — the local
 /// "watch what Claude/Codex is doing" view. Shares the tray item's path.
 #[tauri::command]
 pub fn open_run_terminal(state: State<'_, AppState>) -> Result<(), String> {

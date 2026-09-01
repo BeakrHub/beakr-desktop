@@ -73,10 +73,105 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn windows_shell_display_path(path: &Path) -> std::ffi::OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC_PREFIX: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+
+    if wide.starts_with(VERBATIM_UNC_PREFIX) {
+        let mut shell_path = vec![b'\\' as u16, b'\\' as u16];
+        shell_path.extend_from_slice(&wide[VERBATIM_UNC_PREFIX.len()..]);
+        std::ffi::OsString::from_wide(&shell_path)
+    } else if wide.starts_with(VERBATIM_PREFIX) {
+        std::ffi::OsString::from_wide(&wide[VERBATIM_PREFIX.len()..])
+    } else {
+        path.as_os_str().to_os_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_item_id_list(
+    path: &Path,
+) -> Result<*mut windows_sys::Win32::UI::Shell::Common::ITEMIDLIST, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ILCreateFromPathW;
+
+    // Rust canonicalization adds a verbatim `\\?\` prefix to long Windows
+    // paths. Keep that canonical form everywhere else, but translate only the
+    // Shell display name: Shell item parsing rejects the verbatim namespace.
+    let shell_path = windows_shell_display_path(path);
+    let mut wide_path: Vec<u16> = shell_path.encode_wide().collect();
+    wide_path.push(0);
+
+    // SAFETY: `wide_path` is NUL-terminated and remains alive for this call.
+    unsafe {
+        let item_id_list = ILCreateFromPathW(wide_path.as_ptr());
+        if item_id_list.is_null() {
+            Err(format!(
+                "Windows Shell could not resolve the file path: {}",
+                path.display()
+            ))
+        } else {
+            Ok(item_id_list)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_select_item(path: &Path) -> Result<(), String> {
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::{ILFree, SHOpenFolderAndSelectItems};
+
+    let item_id_list = windows_shell_item_id_list(path)?;
+
+    // SAFETY: `item_id_list` is a valid PIDL allocated by ILCreateFromPathW.
+    // ILFree releases it after SHOpenFolderAndSelectItems has synchronously
+    // consumed it.
+    unsafe {
+        // With cidl == 0, the Shell contract treats pidlFolder as the fully
+        // qualified item to select, opens its parent, and selects that item.
+        let result = SHOpenFolderAndSelectItems(item_id_list, 0, ptr::null(), 0);
+        ILFree(item_id_list);
+
+        if result < 0 {
+            Err(format!(
+                "Windows Shell selection failed with HRESULT 0x{:08X}",
+                result as u32
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_with_windows_shell<F>(path: &Path, select_item: F) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    select_item(path).map_err(|error| format!("Failed to reveal {}: {error}", path.display()))
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    reveal_with_windows_shell(path, windows_shell_select_item)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn reveal_in_file_manager(_path: &Path) -> Result<(), String> {
-    // Windows/Linux support arrives with ENG-206; better a clear error than
-    // a silent no-op the user interprets as a broken button.
+    // Better a clear error than a silent no-op the user interprets as a broken button.
     Err("Revealing files is not supported on this platform yet.".to_string())
 }
 
@@ -129,6 +224,79 @@ mod tests {
 
     fn never_reveal(_: &Path) -> Result<(), String> {
         panic!("reveal must not be called when validation fails");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shell_selection_success_is_reported() {
+        let path = Path::new(r"C:\Dev\beakr-windows-test\onboarding checklist.txt");
+
+        reveal_with_windows_shell(path, |received| {
+            assert_eq!(received, path);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shell_display_path_translates_only_verbatim_namespace() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            windows_shell_display_path(Path::new(r"\\?\C:\very\long\file.md")),
+            OsString::from(r"C:\very\long\file.md")
+        );
+        assert_eq!(
+            windows_shell_display_path(Path::new(r"\\?\UNC\server\share\file.md")),
+            OsString::from(r"\\server\share\file.md")
+        );
+        assert_eq!(
+            windows_shell_display_path(Path::new(r"C:\ordinary\file.md")),
+            OsString::from(r"C:\ordinary\file.md")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_reveal_propagates_shell_selection_failure() {
+        let path = Path::new(r"C:\Dev\beakr-windows-test\notes.md");
+
+        let err = reveal_with_windows_shell(path, |_| {
+            Err("Shell selection failed with HRESULT 0x800700CE".to_string())
+        })
+        .unwrap_err();
+
+        assert!(err.contains("0x800700CE"), "got {err}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shell_resolves_path_beyond_legacy_max_path() {
+        use windows_sys::Win32::UI::Shell::ILFree;
+
+        let tree = TempTree::new("long_shell_path");
+        let mut directory = tree.root.clone();
+        let mut segment = 0;
+        while directory.join("deep-file.md").as_os_str().len() <= 300 {
+            directory.push(format!("level_{segment:02}_padding_segment_for_long_path"));
+            segment += 1;
+        }
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("deep-file.md");
+        fs::write(&file, "long path reveal fixture").unwrap();
+        let canonical = fs::canonicalize(&file).unwrap();
+        assert!(
+            canonical.as_os_str().to_string_lossy().starts_with(r"\\?\"),
+            "Windows long-path fixture should canonicalize with a verbatim prefix: {}",
+            canonical.display()
+        );
+
+        let item_id_list = windows_shell_item_id_list(&canonical).unwrap();
+        assert!(!item_id_list.is_null());
+
+        // SAFETY: the helper returned a PIDL allocated by ILCreateFromPathW.
+        unsafe { ILFree(item_id_list) };
     }
 
     #[test]

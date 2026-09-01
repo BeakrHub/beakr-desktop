@@ -1,11 +1,19 @@
 use std::path::Path;
 
+#[cfg(target_os = "windows")]
+use std::ffi::{OsStr, OsString};
+#[cfg(target_os = "windows")]
+use std::io;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use serde_json::{json, Value};
 
 use crate::security;
 
 /// Handle an `open_terminal` request: open a terminal window at a folder
-/// (Terminal.app on macOS). Triggered by an explicit user click on the
+/// (Terminal.app on macOS, Windows Terminal or PowerShell on Windows).
+/// Triggered by an explicit user click on the
 /// coding-run card's "Open in Terminal" in the web UI and relayed by the
 /// engine — this tool is deliberately NOT exposed to the LLM, so a
 /// prompt-injected document can never spawn terminals on the user's machine.
@@ -78,10 +86,61 @@ fn open_terminal_at(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+
+/// Prefer Windows Terminal and force a new window rooted at `path`. Windows
+/// Terminal is optional, so fall back to a new Windows PowerShell console with
+/// the child's working directory already set. No shell command or path string
+/// is evaluated, which keeps folder names from becoming command input.
+#[cfg(target_os = "windows")]
+fn open_terminal_at(path: &Path) -> Result<(), String> {
+    open_terminal_on_windows_with(path, |program, args, working_dir, creation_flags| {
+        let mut command = std::process::Command::new(program);
+        command.args(args).current_dir(working_dir);
+        if creation_flags != 0 {
+            command.creation_flags(creation_flags);
+        }
+        command.spawn().map(|_| ())
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn open_terminal_on_windows_with<F>(path: &Path, mut launch: F) -> Result<(), String>
+where
+    F: FnMut(&OsStr, &[OsString], &Path, u32) -> io::Result<()>,
+{
+    let windows_terminal_args = [
+        OsString::from("-w"),
+        OsString::from("new"),
+        OsString::from("-d"),
+        path.as_os_str().to_os_string(),
+    ];
+
+    match launch(OsStr::new("wt.exe"), &windows_terminal_args, path, 0) {
+        Ok(()) => Ok(()),
+        Err(windows_terminal_error) => {
+            let powershell_args = [OsString::from("-NoLogo"), OsString::from("-NoExit")];
+            launch(
+                OsStr::new("powershell.exe"),
+                &powershell_args,
+                path,
+                CREATE_NEW_CONSOLE,
+            )
+            .map_err(|powershell_error| {
+                format!(
+                    "Failed to launch Windows Terminal ({windows_terminal_error}); \
+                     PowerShell fallback also failed ({powershell_error})"
+                )
+            })
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn open_terminal_at(_path: &Path) -> Result<(), String> {
-    // Windows/Linux support arrives with ENG-206 (same as reveal_file); a clear
-    // error beats a silent no-op the user reads as a broken button.
+    // Linux is not currently a supported desktop release; keep the failure
+    // explicit rather than silently ignoring an intentional user click.
     Err("Opening a terminal is not supported on this platform yet.".to_string())
 }
 
@@ -184,7 +243,10 @@ mod tests {
             never_open,
         );
         fs::remove_dir_all(&outside).ok();
-        assert!(result.is_err(), "expected out-of-scope error, got {result:?}");
+        assert!(
+            result.is_err(),
+            "expected out-of-scope error, got {result:?}"
+        );
     }
 
     #[test]
@@ -213,5 +275,88 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("Access denied"), "got {err}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_prefers_a_new_windows_terminal_window_at_the_folder() {
+        let tree = TempTree::new("windows-terminal");
+        let dir = tree.mkdir("project with spaces");
+        let mut calls = Vec::new();
+
+        open_terminal_on_windows_with(&dir, |program, args, working_dir, flags| {
+            calls.push((
+                program.to_os_string(),
+                args.to_vec(),
+                working_dir.to_path_buf(),
+                flags,
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, OsString::from("wt.exe"));
+        assert_eq!(
+            calls[0].1,
+            vec![
+                OsString::from("-w"),
+                OsString::from("new"),
+                OsString::from("-d"),
+                dir.as_os_str().to_os_string(),
+            ]
+        );
+        assert_eq!(calls[0].2, dir);
+        assert_eq!(calls[0].3, 0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_falls_back_to_a_new_powershell_console() {
+        let tree = TempTree::new("powershell-fallback");
+        let dir = tree.mkdir("project");
+        let mut calls = Vec::new();
+
+        open_terminal_on_windows_with(&dir, |program, args, working_dir, flags| {
+            calls.push((
+                program.to_os_string(),
+                args.to_vec(),
+                working_dir.to_path_buf(),
+                flags,
+            ));
+            if program == OsStr::new("wt.exe") {
+                Err(io::Error::new(io::ErrorKind::NotFound, "not installed"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, OsString::from("powershell.exe"));
+        assert_eq!(
+            calls[1].1,
+            vec![OsString::from("-NoLogo"), OsString::from("-NoExit")]
+        );
+        assert_eq!(calls[1].2, dir);
+        assert_eq!(calls[1].3, CREATE_NEW_CONSOLE);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_reports_both_launcher_failures() {
+        let tree = TempTree::new("launcher-errors");
+        let dir = tree.mkdir("project");
+
+        let err = open_terminal_on_windows_with(&dir, |program, _, _, _| {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} missing", program.to_string_lossy()),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(err.contains("Windows Terminal"), "got {err}");
+        assert!(err.contains("PowerShell fallback"), "got {err}");
     }
 }

@@ -119,6 +119,13 @@ pub trait LocalCodingRunner: Send + Sync {
     /// process-group + stdio settings afterwards.
     fn build_command(&self, binary: &std::path::Path, spec: &RunSpec) -> Command;
 
+    /// Prompt text to write to the child's stdin, when this CLI supports it.
+    /// This keeps multiline/user-controlled text out of Windows `.cmd` shim
+    /// argv, where `cmd.exe` reparses and can truncate it.
+    fn stdin_prompt<'a>(&self, _spec: &'a RunSpec) -> Option<&'a str> {
+        None
+    }
+
     /// Translate one stdout line (NDJSON for both CLIs).
     fn parse_line(&self, line: &str) -> ParsedLine;
 

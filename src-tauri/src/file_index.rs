@@ -220,7 +220,11 @@ fn scan_dir(dir: &Path, old: &IndexState, next: &mut IndexState) {
         Err(_) => return, // unreadable/removed directory: drop it from the index
     };
 
-    let unchanged = old.dir_mtimes.get(dir) == Some(&mtime);
+    // Windows directory mtimes can remain unchanged across rapid direct-child
+    // additions/removals. A dirty refresh must therefore re-read directories
+    // instead of trusting an mtime equality that can hide fresh files. Searches
+    // still avoid the walk entirely until the watcher or fallback marks dirty.
+    let unchanged = !cfg!(windows) && old.dir_mtimes.get(dir) == Some(&mtime);
 
     let subdirs: Vec<PathBuf> = if unchanged {
         // Direct children are unchanged (an add/remove would bump the mtime),
@@ -347,7 +351,10 @@ mod tests {
         let hits = index.search_names("index", None, None, 20);
         let paths: Vec<String> = hits.iter().map(|f| f.path.display().to_string()).collect();
         assert_eq!(hits.len(), 1, "got {paths:?}");
-        assert!(paths[0].ends_with("src/index.js"), "got {paths:?}");
+        assert!(
+            hits[0].path.ends_with(Path::new("src").join("index.js")),
+            "got {paths:?}"
+        );
     }
 
     #[test]
@@ -373,7 +380,8 @@ mod tests {
         index.refresh(&tree.scoped());
         assert_eq!(index.search_names("first", None, None, 20).len(), 1);
 
-        // Add a file, refresh, and confirm it appears (the dir mtime changed).
+        // ENG-1960: Windows may preserve the directory mtime across these
+        // rapid mutations; a dirty refresh still has to reconcile the tree.
         tree.write("second.txt", "x");
         index.refresh(&tree.scoped());
         assert_eq!(index.search_names("second", None, None, 20).len(), 1);

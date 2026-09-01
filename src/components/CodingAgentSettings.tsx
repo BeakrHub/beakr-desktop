@@ -23,7 +23,10 @@ const CLI_META: Record<
   claude: {
     label: "Claude Code",
     installCmd: "npm install -g @anthropic-ai/claude-code",
-    installUrl: "https://claude.ai/code",
+    // claude.ai/code is the product landing page and points people at the
+    // desktop/web app. This panel is only ever shown when the CLI is missing,
+    // so it has to link to CLI setup instructions instead.
+    installUrl: "https://code.claude.com/docs/en/setup",
     loginHint: "Open a terminal, run `claude`, then `/login`.",
   },
   codex: {
@@ -127,7 +130,7 @@ export default function CodingAgentSettings() {
         Coding Agent
       </h2>
       <p style={{ fontSize: "0.78rem", color: "#666", marginTop: 0, marginBottom: "0.75rem" }}>
-        Beakr can run a coding agent CLI on this Mac when you ask it to. Each
+        Beakr can run a coding agent CLI on this computer when you ask it to. Each
         CLI uses its own login and your own plan — Beakr never handles the
         credential.
       </p>
@@ -143,7 +146,7 @@ export default function CodingAgentSettings() {
             marginBottom: "0.75rem",
           }}
         >
-          No coding agents detected on this Mac. Install one to use this
+          No coding agents detected on this computer. Install one to use this
           feature — Claude Code: <code>{CLI_META.claude.installCmd}</code> or
           Codex: <code>{CLI_META.codex.installCmd}</code> — then sign in and
           reopen this window.
