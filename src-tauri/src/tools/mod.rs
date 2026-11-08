@@ -4,6 +4,7 @@ mod file_info;
 mod list_files;
 mod open_terminal;
 mod read_file;
+pub mod read_file_chunked;
 mod reveal_file;
 mod search_files;
 
@@ -44,7 +45,13 @@ pub async fn dispatch_request(
 /// the cancel signal (their children require cleanup on cancel, so the
 /// select-drop pattern used for read-only tools is not safe for them).
 pub fn is_streaming(tool: &str) -> bool {
-    coding_agent::handles(tool)
+    coding_agent::handles(tool) || tool == read_file_chunked::TOOL
+}
+
+/// Optional protocol features this build supports, advertised on register so
+/// the engine only requests what the connected desktop can serve.
+pub fn capabilities() -> Vec<String> {
+    vec![read_file_chunked::CAPABILITY.to_string()]
 }
 
 pub async fn dispatch_streaming(
@@ -59,6 +66,20 @@ pub async fn dispatch_streaming(
     if coding_agent::handles(tool) {
         return coding_agent::handle_streaming(app, state, params, scoped_folders, stream, cancel)
             .await;
+    }
+    if tool == read_file_chunked::TOOL {
+        // Opened before the first chunk is sent, so no ack can arrive for a
+        // request that has no channel yet. Closed by inflight.finish().
+        let acks = state.inflight.register_chunk_acks(stream.request_id());
+        return read_file_chunked::handle_streaming(
+            params,
+            scoped_folders,
+            &state.file_index,
+            stream,
+            acks,
+            cancel,
+        )
+        .await;
     }
     Err(format!("Unknown streaming tool: {tool}"))
 }

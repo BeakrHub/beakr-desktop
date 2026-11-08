@@ -33,14 +33,25 @@ impl ToolStream {
     /// Send one chunk. A send failure (connection died) is logged, not fatal:
     /// the run continues and its terminal response reports the outcome.
     pub async fn chunk(&self, data: serde_json::Value) {
+        if self.try_chunk(data).await.is_err() {
+            log::debug!("chunk dropped: connection closed (req {})", self.request_id);
+        }
+    }
+
+    /// Send one chunk, reporting a closed connection to the caller. For a
+    /// transfer whose bytes are useless once one chunk is lost (a chunked file
+    /// read), so it stops reading instead of streaming into a dead socket.
+    pub async fn try_chunk(&self, data: serde_json::Value) -> Result<(), ConnectionClosed> {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let msg = protocol::OutgoingMessage::ResponseChunk {
             request_id: self.request_id.clone(),
             seq,
             data,
         };
-        if self.out_tx.send(msg).await.is_err() {
-            log::debug!("chunk dropped: connection closed (req {})", self.request_id);
-        }
+        self.out_tx.send(msg).await.map_err(|_| ConnectionClosed)
     }
 }
+
+/// The connection a request arrived on closed before a chunk could be queued.
+#[derive(Debug)]
+pub struct ConnectionClosed;

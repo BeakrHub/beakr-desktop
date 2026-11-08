@@ -258,6 +258,7 @@ impl WsClient {
             app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             coding_agents,
             coding_agent_default,
+            capabilities: tools::capabilities(),
         };
 
         let register_json = serde_json::to_string(&register)?;
@@ -487,6 +488,12 @@ impl WsClient {
                     // Protocol contract: cancelling an unknown/finished id is
                     // a no-op (the terminal response may already be in flight).
                     log::debug!("Cancel for unknown/finished request {request_id}");
+                }
+            }
+            IncomingMessage::ChunkAck { request_id, index } => {
+                if !self.state.inflight.ack_chunk(&request_id, index) {
+                    // Same contract as cancel: the transfer may have just ended.
+                    log::debug!("Chunk ack for unknown/finished request {request_id}");
                 }
             }
             IncomingMessage::Registered { .. } => {
