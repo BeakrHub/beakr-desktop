@@ -44,6 +44,36 @@ impl CancelSignal {
     }
 }
 
+/// Receiver half of a chunked transfer's acknowledgement channel
+/// (`read_file_chunked`, ENG-1643): the engine acknowledges each chunk it has
+/// durably consumed, and the reader waits on this before sending past its
+/// window, so neither the desktop, the relay nor the engine ever buffers more
+/// than `window` chunks of one file.
+pub struct ChunkAcks {
+    rx: watch::Receiver<u64>,
+}
+
+impl ChunkAcks {
+    /// How many chunks the engine has acknowledged (acks are cumulative: an
+    /// ack for index `i` covers every chunk up to and including `i`).
+    pub fn acknowledged(&self) -> u64 {
+        *self.rx.borrow()
+    }
+
+    /// Wait until at least `count` chunks are acknowledged. Returns false when
+    /// the request was unregistered first (it can never be acknowledged now).
+    pub async fn wait_for(&mut self, count: u64) -> bool {
+        loop {
+            if *self.rx.borrow() >= count {
+                return true;
+            }
+            if self.rx.changed().await.is_err() {
+                return *self.rx.borrow() >= count;
+            }
+        }
+    }
+}
+
 /// Guard for the single concurrent coding-run slot. Dropping it frees the slot.
 pub struct CodingRunGuard {
     _permit: OwnedSemaphorePermit,
@@ -52,6 +82,9 @@ pub struct CodingRunGuard {
 /// Registry of in-flight requests + the coding-run concurrency cap.
 pub struct InflightRegistry {
     requests: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Acknowledged-chunk counts for in-flight chunked transfers, keyed by
+    /// request id. Only `read_file_chunked` requests have an entry.
+    chunk_acks: Mutex<HashMap<String, watch::Sender<u64>>>,
     /// One coding run at a time per device: local CLIs are heavyweight (model
     /// inference, file edits in a workspace) and concurrent runs in the same
     /// scoped folders could interleave edits.
@@ -68,6 +101,7 @@ impl InflightRegistry {
     pub fn new() -> Self {
         Self {
             requests: Mutex::new(HashMap::new()),
+            chunk_acks: Mutex::new(HashMap::new()),
             coding_slot: Arc::new(Semaphore::new(1)),
         }
     }
@@ -100,6 +134,44 @@ impl InflightRegistry {
             .lock()
             .expect("inflight lock poisoned")
             .remove(request_id);
+        self.chunk_acks
+            .lock()
+            .expect("inflight lock poisoned")
+            .remove(request_id);
+    }
+
+    /// Open the acknowledgement channel for a chunked transfer. Removed by
+    /// [`InflightRegistry::finish`] with the rest of the request's state.
+    pub fn register_chunk_acks(&self, request_id: &str) -> ChunkAcks {
+        let (tx, rx) = watch::channel(0u64);
+        self.chunk_acks
+            .lock()
+            .expect("inflight lock poisoned")
+            .insert(request_id.to_string(), tx);
+        ChunkAcks { rx }
+    }
+
+    /// Record the engine's acknowledgement of chunk `index` (cumulative).
+    /// Returns false when the request has no open chunk channel (unknown or
+    /// finished) - a no-op, like cancelling a finished request. An ack never
+    /// moves the count backwards, so a reordered or duplicate ack is harmless.
+    pub fn ack_chunk(&self, request_id: &str, index: u64) -> bool {
+        let map = self.chunk_acks.lock().expect("inflight lock poisoned");
+        match map.get(request_id) {
+            Some(tx) => {
+                let acknowledged = index.saturating_add(1);
+                tx.send_if_modified(|count| {
+                    if acknowledged > *count {
+                        *count = acknowledged;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                true
+            }
+            None => false,
+        }
     }
 
     /// Cancel everything currently in flight (app shutdown / user disconnect).
@@ -173,6 +245,52 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), signal.cancelled())
             .await
             .expect("cancelled() must resolve when the sender is dropped");
+    }
+
+    #[tokio::test]
+    async fn chunk_acks_are_cumulative_and_never_move_backwards() {
+        let reg = InflightRegistry::new();
+        let mut acks = reg.register_chunk_acks("req-1");
+        assert_eq!(acks.acknowledged(), 0);
+
+        assert!(reg.ack_chunk("req-1", 2));
+        assert_eq!(acks.acknowledged(), 3);
+        // A late or duplicate ack for an earlier chunk changes nothing.
+        assert!(reg.ack_chunk("req-1", 0));
+        assert_eq!(acks.acknowledged(), 3);
+
+        tokio::time::timeout(Duration::from_secs(1), acks.wait_for(3))
+            .await
+            .expect("an already-satisfied wait returns at once");
+    }
+
+    #[tokio::test]
+    async fn chunk_ack_wakes_a_waiting_reader() {
+        let reg = std::sync::Arc::new(InflightRegistry::new());
+        let mut acks = reg.register_chunk_acks("req-1");
+        let waiter = tokio::spawn(async move { acks.wait_for(2).await });
+        reg.ack_chunk("req-1", 0);
+        reg.ack_chunk("req-1", 1);
+        let satisfied = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_for must resolve once enough chunks are acknowledged")
+            .unwrap();
+        assert!(satisfied);
+    }
+
+    #[tokio::test]
+    async fn finish_drops_chunk_acks_and_unblocks_the_reader() {
+        let reg = InflightRegistry::new();
+        let mut acks = reg.register_chunk_acks("req-1");
+        reg.finish("req-1");
+        let satisfied = tokio::time::timeout(Duration::from_secs(1), acks.wait_for(1))
+            .await
+            .expect("wait_for must not hang once the request is gone");
+        assert!(!satisfied);
+        assert!(
+            !reg.ack_chunk("req-1", 0),
+            "an ack for a finished request is a no-op"
+        );
     }
 
     #[test]

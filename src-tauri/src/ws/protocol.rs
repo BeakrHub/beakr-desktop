@@ -25,6 +25,11 @@ pub enum OutgoingMessage {
         /// 2026-07-17). None = claude (the pre-picker behavior).
         #[serde(skip_serializing_if = "Option::is_none")]
         coding_agent_default: Option<String>,
+        /// Optional protocol features this build supports (e.g.
+        /// `chunked_read`, ENG-1643). Additive: an engine that predates a
+        /// capability ignores it, and the engine only uses a feature the
+        /// connected device advertised, so old desktops keep the old paths.
+        capabilities: Vec<String>,
     },
     /// Pushed when readiness-affecting settings change while connected (the
     /// Default CLI radio), so the web's display updates without a reconnect.
@@ -84,6 +89,14 @@ pub enum IncomingMessage {
     Cancel {
         request_id: String,
     },
+    /// The engine has consumed chunk `index` of a `read_file_chunked`
+    /// transfer, and every chunk before it (cumulative). The reader keeps at
+    /// most its window of chunks unacknowledged (ENG-1643). An ack for an
+    /// unknown/finished request is a no-op.
+    ChunkAck {
+        request_id: String,
+        index: u64,
+    },
 }
 
 #[cfg(test)]
@@ -112,6 +125,34 @@ mod tests {
             incoming,
             IncomingMessage::Cancel { request_id } if request_id == "req-9"
         ));
+    }
+
+    #[test]
+    fn chunk_ack_deserializes_from_engine_envelope() {
+        let incoming: IncomingMessage =
+            serde_json::from_str(r#"{"type":"chunk_ack","request_id":"req-3","index":12}"#)
+                .unwrap();
+        assert!(matches!(
+            incoming,
+            IncomingMessage::ChunkAck { request_id, index } if request_id == "req-3" && index == 12
+        ));
+    }
+
+    #[test]
+    fn register_advertises_capabilities() {
+        let msg = OutgoingMessage::Register {
+            device_name: "Laptop".into(),
+            platform: "macos".into(),
+            scoped_folders: vec![],
+            platform_version: None,
+            app_version: None,
+            coding_agents: None,
+            coding_agent_default: None,
+            capabilities: vec!["chunked_read".into()],
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "register");
+        assert_eq!(v["capabilities"], serde_json::json!(["chunked_read"]));
     }
 
     #[test]

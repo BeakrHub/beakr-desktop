@@ -1,4 +1,5 @@
 use std::io::{BufReader, Read};
+use std::path::PathBuf;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
@@ -8,6 +9,30 @@ use crate::security;
 
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
 const BINARY_CHECK_SIZE: usize = 8192;
+
+/// The access checks every whole-file read applies, in one place so the
+/// single-message `read_file` and the chunked `read_file_chunked` (ENG-1643)
+/// can never disagree about what may be read: the path must resolve
+/// (symlinks and `..` included) inside a scoped folder, must not be on the
+/// sensitive-file deny list, and must not be a directory.
+pub(crate) fn resolve_readable_file(
+    path: &str,
+    scoped_folders: &[String],
+) -> Result<(PathBuf, std::fs::Metadata), String> {
+    let canonical = security::validate_path(path, scoped_folders).map_err(|e| e.to_string())?;
+
+    if security::is_denied(&canonical) {
+        return Err(format!("Access denied — sensitive file: {path}"));
+    }
+
+    let metadata = std::fs::metadata(&canonical).map_err(|e| format!("Cannot read file: {e}"))?;
+
+    if metadata.is_dir() {
+        return Err("Cannot read a directory. Use list_files instead.".to_string());
+    }
+
+    Ok((canonical, metadata))
+}
 
 /// Handle a `read_file` request.
 ///
@@ -30,26 +55,13 @@ pub async fn handle(
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
 
-    // Validate path
-    let canonical = security::validate_path(path, scoped_folders).map_err(|e| e.to_string())?;
-
-    // Check deny list
-    if security::is_denied(&canonical) {
-        return Err(format!("Access denied — sensitive file: {path}"));
-    }
-
-    // Check file size
-    let metadata = std::fs::metadata(&canonical).map_err(|e| format!("Cannot read file: {e}"))?;
+    let (canonical, metadata) = resolve_readable_file(path, scoped_folders)?;
 
     if metadata.len() > MAX_FILE_SIZE {
         return Err(format!(
             "File too large ({:.1} MB). Maximum is 50 MB. Use local_file_info for metadata.",
             metadata.len() as f64 / 1024.0 / 1024.0
         ));
-    }
-
-    if metadata.is_dir() {
-        return Err("Cannot read a directory. Use list_files instead.".to_string());
     }
 
     // Record the read so this file ranks higher in future searches (frecency).
