@@ -9,8 +9,10 @@
 //!    (the same watch-plus-rescan pattern Spotlight and Everything use).
 //!
 //! Both layers only ever flip a flag; the flag naturally coalesces bursts of
-//! events, so no event debouncing is needed. The actual (incremental) re-walk
-//! happens lazily inside `FileIndex::ensure_fresh` at query time.
+//! events, so no event debouncing is needed. The (incremental) re-walk runs on
+//! its own thread: at launch and whenever the folder set changes (below), and
+//! when a search finds the flag set (`FileIndex::prepare_search`), which waits
+//! for it only within a bound.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -43,6 +45,10 @@ pub fn spawn(state: AppState) {
     tauri::async_runtime::spawn(async move {
         loop {
             let folders = state.scoped_folders.read().await.clone();
+            // Build (or rebuild) the index now, on its own thread, so the first
+            // search after launch or after a folder change finds it ready
+            // instead of walking every shared folder inside the request.
+            state.file_index.start_refresh(&folders);
             // Keep the watcher alive for as long as these roots are current.
             let _watcher = build_watcher(&folders, state.file_index.clone());
             // A new folder set makes these roots (and the watcher) stale.

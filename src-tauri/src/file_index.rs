@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, RwLock};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -58,6 +58,28 @@ pub struct FileIndex {
     /// the filesystem watcher or the periodic fallback). `ensure_fresh` only
     /// re-walks when this is set, so most searches skip the walk entirely.
     dirty: AtomicBool,
+    /// Set while a background refresh is running, so at most one walk runs at
+    /// a time and searches can wait for it instead of starting another.
+    refreshing: AtomicBool,
+}
+
+/// Whether a search can be answered from the index.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IndexReadiness {
+    /// The index covers the requested folders (possibly a little stale).
+    Ready,
+    /// The first scan of these folders is still running.
+    StillIndexing,
+}
+
+/// Clears `refreshing` when a background refresh ends, even if the walk panics,
+/// so a failed walk can never block every later refresh.
+struct RefreshingGuard(Arc<FileIndex>);
+
+impl Drop for RefreshingGuard {
+    fn drop(&mut self) {
+        self.0.refreshing.store(false, Ordering::Release);
+    }
 }
 
 impl Default for FileIndex {
@@ -72,12 +94,18 @@ impl FileIndex {
             state: RwLock::new(IndexState::default()),
             access: Mutex::new(HashMap::new()),
             dirty: AtomicBool::new(true), // first search builds the index
+            refreshing: AtomicBool::new(false),
         }
     }
 
     /// Record that `path` was read, boosting its future ranking (frecency).
     pub fn record_access(&self, path: &Path) {
-        *self.access.lock().unwrap().entry(path.to_path_buf()).or_insert(0) += 1;
+        *self
+            .access
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_insert(0) += 1;
     }
 
     /// Flag that the scoped trees may have changed; the next `ensure_fresh`
@@ -86,12 +114,68 @@ impl FileIndex {
         self.dirty.store(true, Ordering::Release);
     }
 
-    /// Refresh the index only if it has been marked dirty since the last walk.
-    /// A file change between the flag-clear and the walk simply re-sets the
-    /// flag, so the following search reconciles it — no update is lost.
+    /// Refresh synchronously if the index has been marked dirty since the last
+    /// walk. Blocks for the whole walk, so the search path uses
+    /// `prepare_search` instead; the incremental-refresh tests drive it.
+    #[cfg(test)]
     pub fn ensure_fresh(&self, roots: &[String]) {
         if self.dirty.swap(false, Ordering::AcqRel) {
             self.refresh(roots);
+        }
+    }
+
+    /// Whether the current snapshot was built for exactly `roots`.
+    pub fn is_built_for(&self, roots: &[String]) -> bool {
+        self.state.read().unwrap().roots == roots
+    }
+
+    /// Start a refresh of `roots` on its own thread unless one is running.
+    ///
+    /// The walk used to run inside the search request: a first search after
+    /// launch walked every scoped folder before answering (2.5 minutes on
+    /// 2026-11-10), longer than the engine's 30-second wait for a tool reply,
+    /// so the agent never got an answer. Walking on a separate thread lets the
+    /// app build the index at launch and lets a search answer within a bound.
+    pub fn start_refresh(self: &Arc<Self>, roots: &[String]) {
+        if self
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // a walk is already running; it will be the one waited on
+        }
+        // Cleared before the walk: a change during the walk re-sets it, so the
+        // next search starts another refresh and no update is lost.
+        self.dirty.store(false, Ordering::Release);
+        let index = Arc::clone(self);
+        let roots = roots.to_vec();
+        let spawned = std::thread::Builder::new()
+            .name("beakr-file-index".into())
+            .spawn(move || {
+                let _guard = RefreshingGuard(Arc::clone(&index));
+                index.refresh(&roots);
+            });
+        if spawned.is_err() {
+            self.refreshing.store(false, Ordering::Release);
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Get the index ready to answer a search over `roots`, waiting at most
+    /// `wait` for a refresh. A stale-but-built index still answers; only a scan
+    /// that has never finished for these folders reports `StillIndexing`.
+    pub fn prepare_search(self: &Arc<Self>, roots: &[String], wait: Duration) -> IndexReadiness {
+        if !self.is_built_for(roots) || self.dirty.load(Ordering::Acquire) {
+            self.start_refresh(roots);
+            let deadline = Instant::now() + wait;
+            while self.refreshing.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if self.is_built_for(roots) {
+            IndexReadiness::Ready
+        } else {
+            IndexReadiness::StillIndexing
         }
     }
 
@@ -233,7 +317,8 @@ fn scan_dir(dir: &Path, old: &IndexState, next: &mut IndexState) {
             next.files.insert(dir.to_path_buf(), cached.clone());
         }
         let cached_subdirs = old.subdirs.get(dir).cloned().unwrap_or_default();
-        next.subdirs.insert(dir.to_path_buf(), cached_subdirs.clone());
+        next.subdirs
+            .insert(dir.to_path_buf(), cached_subdirs.clone());
         cached_subdirs
     } else {
         // Re-read this directory's entries and re-stat its files.
@@ -297,7 +382,8 @@ mod tests {
     impl TempTree {
         fn new(tag: &str) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let root = env::temp_dir().join(format!("beakr_index_test_{tag}_{}_{n}", std::process::id()));
+            let root =
+                env::temp_dir().join(format!("beakr_index_test_{tag}_{}_{n}", std::process::id()));
             fs::create_dir_all(&root).unwrap();
             Self { root }
         }
@@ -355,6 +441,80 @@ mod tests {
             hits[0].path.ends_with(Path::new("src").join("index.js")),
             "got {paths:?}"
         );
+    }
+
+    #[test]
+    fn first_search_builds_the_index_off_the_request_and_answers() {
+        let tree = TempTree::new("prepare_first");
+        tree.write("notes/harvey_trace_package.zip", "x");
+        let index = Arc::new(FileIndex::new());
+
+        let readiness = index.prepare_search(&tree.scoped(), Duration::from_secs(10));
+
+        assert_eq!(readiness, IndexReadiness::Ready);
+        let hits = index.search_names("harvey trace", None, None, 20);
+        assert_eq!(hits.len(), 1);
+        assert!(
+            !index.refreshing.load(Ordering::Acquire),
+            "the walk must release its slot"
+        );
+    }
+
+    #[test]
+    fn a_search_during_an_unfinished_first_scan_answers_within_its_bound() {
+        // Regression (2026-11-10): the first search after launch walked every
+        // shared folder inside the request for 2.5 minutes, past the engine's
+        // 30-second wait, so the agent got no answer at all. While a first scan
+        // is still running, a search must come back within its bound.
+        let tree = TempTree::new("prepare_busy");
+        tree.write("a.txt", "x");
+        let index = Arc::new(FileIndex::new());
+        // Another walk holds the slot and has not finished.
+        index.refreshing.store(true, Ordering::Release);
+
+        let started = Instant::now();
+        let readiness = index.prepare_search(&tree.scoped(), Duration::from_millis(100));
+
+        assert_eq!(readiness, IndexReadiness::StillIndexing);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_stale_index_refreshes_before_answering_when_it_can() {
+        let tree = TempTree::new("prepare_dirty");
+        tree.write("old.txt", "x");
+        let index = Arc::new(FileIndex::new());
+        assert_eq!(
+            index.prepare_search(&tree.scoped(), Duration::from_secs(10)),
+            IndexReadiness::Ready
+        );
+
+        tree.write("brand_new_report.txt", "x");
+        index.mark_dirty();
+        assert_eq!(
+            index.prepare_search(&tree.scoped(), Duration::from_secs(10)),
+            IndexReadiness::Ready
+        );
+
+        assert_eq!(
+            index.search_names("brand new report", None, None, 20).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_stale_but_built_index_still_answers_when_the_refresh_is_slow() {
+        let tree = TempTree::new("prepare_stale");
+        tree.write("kept.txt", "x");
+        let index = Arc::new(FileIndex::new());
+        index.prepare_search(&tree.scoped(), Duration::from_secs(10));
+        index.mark_dirty();
+        index.refreshing.store(true, Ordering::Release); // a slow walk is running
+
+        let readiness = index.prepare_search(&tree.scoped(), Duration::from_millis(50));
+
+        assert_eq!(readiness, IndexReadiness::Ready);
+        assert_eq!(index.search_names("kept", None, None, 20).len(), 1);
     }
 
     #[test]
