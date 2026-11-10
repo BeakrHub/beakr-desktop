@@ -120,11 +120,11 @@ warm disk cache for both rows.
 
 | | 0.6.1 | 0.6.2 |
 |---|---|---|
-| Full scan from nothing | 116 s | 27 s |
-| Full rescan, nothing changed | 31 s | 6.5 s |
+| Full scan from nothing | 116 s | 28 s |
+| Full rescan, nothing changed | 31 s | 6.8 s |
 | Memory after the scan | 2.0 GB | 0.44 GB |
-| Memory after a rescan | 4.2 GB | 0.54 GB |
-| One search | 1.4 to 5.0 s | 0.07 to 0.47 s |
+| Memory after a rescan | 4.2 GB | 0.51 GB |
+| One search | 1.4 to 5.0 s | 0.07 to 0.55 s |
 
 In 0.6.1 a search after any change also waited (up to 20 s) for the rescan;
 in 0.6.2 it waits only for the changed folders the watcher reported.

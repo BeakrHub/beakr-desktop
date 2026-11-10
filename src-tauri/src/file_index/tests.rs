@@ -456,6 +456,36 @@ fn watcher_paths_under_a_symlinked_shared_folder_are_mapped_back() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn an_indexed_folder_replaced_by_a_symlink_is_not_followed() {
+    // A folder indexed as a real directory can later become a symlink to
+    // somewhere outside the shared folders. Re-reading it by path would list
+    // outside names in search results, so it must drop out instead.
+    let shared = TempTree::new("swap_shared");
+    let outside = TempTree::new("swap_outside");
+    shared.write("projects/plan.md", "x");
+    outside.write("secret_outside_scope.txt", "x");
+    let index = Arc::new(FileIndex::new());
+    index.refresh(&shared.scoped());
+
+    fs::remove_dir_all(shared.root.join("projects")).unwrap();
+    std::os::unix::fs::symlink(&outside.root, shared.root.join("projects")).unwrap();
+
+    // Both update paths: the watcher's targeted re-read, and a full rescan.
+    let changed: HashSet<PathBuf> = [shared.root.join("projects"), shared.root.clone()]
+        .into_iter()
+        .collect();
+    index.apply_changes(&changed);
+    assert!(index
+        .search_names("secret outside", None, None, 20)
+        .is_empty());
+    index.refresh(&shared.scoped());
+    assert!(index
+        .search_names("secret outside", None, None, 20)
+        .is_empty());
+}
+
 #[test]
 fn applying_changes_adds_new_folders_and_drops_deleted_ones() {
     let tree = TempTree::new("apply_changes");

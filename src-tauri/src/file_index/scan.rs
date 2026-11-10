@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::SystemTime;
 
 use super::store::{modified_secs, DirEntry, DirFiles, IndexState};
 use crate::{search_filter, security};
@@ -26,11 +27,27 @@ fn scan_threads() -> usize {
         .clamp(1, 6)
 }
 
+/// The modification time of `dir`, or `None` if it should not be read: gone,
+/// unreadable, or a symlink that is not itself a shared folder. A folder
+/// listed as a real directory can be replaced by a symlink later; following
+/// it would index names from outside the shared folders, so a non-root
+/// symlink is treated as removed. A shared folder that is a symlink
+/// (`~/Dropbox` on current macOS) is followed, as the user chose it.
+fn directory_mtime(dir: &Path, is_root: bool) -> Option<SystemTime> {
+    if !is_root {
+        let link = std::fs::symlink_metadata(dir).ok()?;
+        if !link.file_type().is_dir() {
+            return None;
+        }
+    }
+    std::fs::metadata(dir).and_then(|m| m.modified()).ok()
+}
+
 /// Read one directory: its modification time, the subdirectories worth
-/// indexing, and its files. `None` when it cannot be read (removed, or no
-/// permission), which drops it from the index.
-fn read_directory(dir: &Path) -> Option<DirEntry> {
-    let mtime = std::fs::metadata(dir).and_then(|m| m.modified()).ok()?;
+/// indexing, and its files. `None` when it should not be read (see
+/// [`directory_mtime`]), which drops it from the index.
+fn read_directory(dir: &Path, is_root: bool) -> Option<DirEntry> {
+    let mtime = directory_mtime(dir, is_root)?;
     let mut files = Vec::new();
     let mut subdirs = Vec::new();
     if let Ok(read) = std::fs::read_dir(dir) {
@@ -66,8 +83,8 @@ fn read_directory(dir: &Path) -> Option<DirEntry> {
 
 /// The cached entry for `dir` if the directory has not changed since `old` was
 /// taken, read from disk otherwise. `None` if it can no longer be read.
-fn reuse_or_read(dir: &Path, old: &IndexState) -> Option<DirEntry> {
-    let mtime = std::fs::metadata(dir).and_then(|m| m.modified()).ok()?;
+fn reuse_or_read(dir: &Path, is_root: bool, old: &IndexState) -> Option<DirEntry> {
+    let mtime = directory_mtime(dir, is_root)?;
     // Windows directory mtimes can stay the same across rapid direct-child
     // additions and removals (ENG-1960), so there a cached list is never
     // trusted and every directory is re-read.
@@ -78,7 +95,7 @@ fn reuse_or_read(dir: &Path, old: &IndexState) -> Option<DirEntry> {
             }
         }
     }
-    read_directory(dir)
+    read_directory(dir, is_root)
 }
 
 /// Shared work list for the scan threads: directories still to visit, and how
@@ -90,8 +107,18 @@ struct WorkList {
 
 /// Walk `starts` and everything below them, returning one entry per readable
 /// directory. Entries of directories unchanged since `old` are shared, not
-/// re-read.
-fn walk(starts: Vec<Arc<Path>>, old: &IndexState) -> Vec<(Arc<Path>, DirEntry)> {
+/// re-read. `starts_are_roots` lets a start that is a symlink be followed
+/// (only shared folders themselves may be).
+fn walk(
+    starts: Vec<Arc<Path>>,
+    starts_are_roots: bool,
+    old: &IndexState,
+) -> Vec<(Arc<Path>, DirEntry)> {
+    let roots: HashSet<Arc<Path>> = if starts_are_roots {
+        starts.iter().cloned().collect()
+    } else {
+        HashSet::new()
+    };
     let threads = scan_threads();
     let work = Mutex::new(WorkList {
         pending: starts,
@@ -122,7 +149,7 @@ fn walk(starts: Vec<Arc<Path>>, old: &IndexState) -> Vec<(Arc<Path>, DirEntry)> 
                             more.notify_all(); // let the other threads see the end
                             return found;
                         };
-                        let entry = reuse_or_read(&dir, old);
+                        let entry = reuse_or_read(&dir, roots.contains(&dir), old);
                         let mut list = work.lock().unwrap();
                         if let Some(entry) = &entry {
                             list.pending.extend(entry.subdirs.iter().cloned());
@@ -154,7 +181,7 @@ pub(super) fn full_scan(roots: &[String], old: &IndexState) -> IndexState {
         .map(|root| Arc::<Path>::from(PathBuf::from(root)))
         .filter(|root| !security::is_denied(root)) // never index a denied root
         .collect();
-    let dirs: HashMap<Arc<Path>, DirEntry> = walk(starts, reusable).into_iter().collect();
+    let dirs: HashMap<Arc<Path>, DirEntry> = walk(starts, true, reusable).into_iter().collect();
     let real_roots = roots
         .iter()
         .filter_map(|root| {
@@ -195,7 +222,11 @@ pub(super) fn rescan_dirs(changed: &HashSet<PathBuf>, current: &IndexState) -> C
         let Some((key, old_entry)) = current.dirs.get_key_value(dir.as_path()) else {
             continue;
         };
-        match read_directory(dir) {
+        let is_root = current
+            .roots
+            .iter()
+            .any(|root| Path::new(root) == dir.as_path());
+        match read_directory(dir, is_root) {
             None => changes.removed.push(Arc::clone(key)),
             Some(entry) => {
                 let before: HashSet<&Arc<Path>> = old_entry.subdirs.iter().collect();
@@ -216,7 +247,7 @@ pub(super) fn rescan_dirs(changed: &HashSet<PathBuf>, current: &IndexState) -> C
     if !new_subtrees.is_empty() {
         changes
             .updated
-            .extend(walk(new_subtrees, &IndexState::default()));
+            .extend(walk(new_subtrees, false, &IndexState::default()));
     }
     changes
 }
