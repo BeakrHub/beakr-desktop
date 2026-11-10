@@ -46,6 +46,13 @@ const REVOKE_403_THRESHOLD: u32 = 5;
 /// run() can count consecutive occurrences across reconnect attempts.
 const HANDSHAKE_403_MARKER: &str = "handshake_403_forbidden";
 const CLOSE_SESSION_EXPIRED: u16 = 4011;
+/// Retry interval once handshake 403s have reached REVOKE_403_THRESHOLD on an
+/// endpoint that has never accepted this token, where the token may not be
+/// cleared (ENG-2000: a build pointed at the wrong environment must not
+/// destroy a pairing). Before this, such a client retried every ~15 s forever:
+/// production logged ~630 rejected handshakes in two hours on 2026-11-10 from
+/// devices whose tokens were no longer valid.
+const REJECTED_TOKEN_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 pub struct WsClient {
     app: AppHandle,
@@ -123,9 +130,16 @@ impl WsClient {
 
             self.set_status(ConnectionStatus::Reconnecting).await;
 
-            // Exponential backoff with jitter
-            let base = Duration::from_secs(1 << attempt.min(4));
-            let backoff = base.min(MAX_BACKOFF);
+            // Exponential backoff with jitter; a token this endpoint keeps
+            // rejecting waits far longer (see REJECTED_TOKEN_BACKOFF).
+            let backoff = reconnect_backoff(attempt, consecutive_403s);
+            if consecutive_403s == REVOKE_403_THRESHOLD {
+                log::warn!(
+                    "This server keeps rejecting the stored pairing; retrying every {} minutes. \
+                     Pair this computer again if it was unpaired.",
+                    REJECTED_TOKEN_BACKOFF.as_secs() / 60
+                );
+            }
             let jitter_factor = rand::thread_rng().gen_range(0.8..1.2);
             let wait = backoff.mul_f64(jitter_factor);
 
@@ -208,10 +222,7 @@ impl WsClient {
                 if is_revoked_handshake(&e) {
                     let endpoint_has_succeeded =
                         crate::config::has_successful_ws_registration(&self.app, &self.ws_url);
-                    if handshake_403_is_terminal(
-                        consecutive_403s + 1,
-                        endpoint_has_succeeded,
-                    ) {
+                    if handshake_403_is_terminal(consecutive_403s + 1, endpoint_has_succeeded) {
                         log::warn!(
                             "Handshake rejected with 403 Forbidden {} times — device token revoked",
                             consecutive_403s + 1
@@ -293,8 +304,7 @@ impl WsClient {
 
         *self.state.device_id.write().await = Some(device_id.clone());
         self.set_status(ConnectionStatus::Connected).await;
-        if let Err(error) =
-            crate::config::mark_successful_ws_registration(&self.app, &self.ws_url)
+        if let Err(error) = crate::config::mark_successful_ws_registration(&self.app, &self.ws_url)
         {
             // Fail safe: without persisted proof, later handshake failures
             // remain retryable and can never delete the stored token.
@@ -333,8 +343,7 @@ impl WsClient {
         // and force a spurious reconnect mid-run (the ENG-1261 detector), and
         // would serialize every other tool behind the slow one. Tasks send
         // their frames here; only this loop touches the socket.
-        let (out_tx, mut out_rx) =
-            tokio::sync::mpsc::channel::<OutgoingMessage>(OUTBOUND_BUFFER);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<OutgoingMessage>(OUTBOUND_BUFFER);
 
         // Expose the outbound queue so settings changes can push a
         // readiness_update mid-connection (ENG-1536). Cleared on every exit
@@ -457,11 +466,7 @@ impl WsClient {
     /// Handle an incoming text message. Requests are dispatched as their own
     /// tasks (never awaited here — see the outbound-channel note in
     /// `message_loop`); cancels resolve against the in-flight registry.
-    fn handle_text_message(
-        &self,
-        text: &str,
-        out_tx: &tokio::sync::mpsc::Sender<OutgoingMessage>,
-    ) {
+    fn handle_text_message(&self, text: &str, out_tx: &tokio::sync::mpsc::Sender<OutgoingMessage>) {
         let incoming: IncomingMessage = match serde_json::from_str(text) {
             Ok(m) => m,
             Err(e) => {
@@ -540,8 +545,16 @@ async fn run_request(
     // their own cancellation instead of being dropped by this outer race.
     let response = if tools::is_streaming(&tool) {
         let stream = crate::ws::ToolStream::new(request_id.clone(), out_tx.clone());
-        tools::dispatch_streaming(&app, &state, &tool, params, &scoped_folders, &stream, cancel)
-            .await
+        tools::dispatch_streaming(
+            &app,
+            &state,
+            &tool,
+            params,
+            &scoped_folders,
+            &stream,
+            cancel,
+        )
+        .await
     } else {
         let mut cancel = cancel;
         tokio::select! {
@@ -608,6 +621,17 @@ fn handshake_403_is_terminal(consecutive_403s: u32, endpoint_has_succeeded: bool
     endpoint_has_succeeded && consecutive_403s >= REVOKE_403_THRESHOLD
 }
 
+/// Delay before the next connection attempt, before jitter. Normal failures
+/// back off exponentially to MAX_BACKOFF; a run of handshake 403s that has
+/// reached REVOKE_403_THRESHOLD without being terminal (the endpoint never
+/// accepted this token, so it may not be cleared) waits REJECTED_TOKEN_BACKOFF.
+fn reconnect_backoff(attempt: u32, consecutive_403s: u32) -> Duration {
+    if consecutive_403s >= REVOKE_403_THRESHOLD {
+        return REJECTED_TOKEN_BACKOFF;
+    }
+    Duration::from_secs(1 << attempt.min(4)).min(MAX_BACKOFF)
+}
+
 /// Whether the WebSocket link should be considered dead, given how long it has
 /// been since the last inbound frame. Extracted as a pure function so the
 /// liveness invariant is unit-testable without a live socket.
@@ -655,9 +679,7 @@ pub fn os_version() -> String {
         use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
         let mut command = std::process::Command::new("cmd");
-        command
-            .args(["/C", "ver"])
-            .creation_flags(CREATE_NO_WINDOW);
+        command.args(["/C", "ver"]).creation_flags(CREATE_NO_WINDOW);
         command
             .output()
             .ok()
@@ -724,11 +746,31 @@ mod tests {
 
     #[test]
     fn endpoint_that_never_registered_cannot_revoke_the_stored_token() {
-        assert!(!handshake_403_is_terminal(
-            REVOKE_403_THRESHOLD,
-            false
-        ));
+        assert!(!handshake_403_is_terminal(REVOKE_403_THRESHOLD, false));
         assert!(handshake_403_is_terminal(REVOKE_403_THRESHOLD, true));
+    }
+
+    #[test]
+    fn a_token_the_server_keeps_rejecting_backs_off_to_ten_minutes() {
+        // Regression (2026-11-10): an install whose endpoint never accepted its
+        // token may not clear it (ENG-2000), so it retried every ~15 s forever.
+        // Below the threshold the normal exponential backoff still applies.
+        assert_eq!(reconnect_backoff(0, 0), Duration::from_secs(1));
+        assert_eq!(reconnect_backoff(9, 0), Duration::from_secs(16));
+        assert_eq!(
+            reconnect_backoff(4, REVOKE_403_THRESHOLD - 1),
+            Duration::from_secs(16)
+        );
+        assert_eq!(
+            reconnect_backoff(5, REVOKE_403_THRESHOLD),
+            REJECTED_TOKEN_BACKOFF
+        );
+        assert_eq!(
+            reconnect_backoff(40, REVOKE_403_THRESHOLD + 30),
+            REJECTED_TOKEN_BACKOFF
+        );
+        // The token is still never cleared for an endpoint that never accepted it.
+        assert!(!handshake_403_is_terminal(REVOKE_403_THRESHOLD + 30, false));
     }
 
     #[test]
@@ -784,9 +826,7 @@ mod tests {
 /// Clears `AppState::ws_outbound` when the connection loop exits by any path
 /// (error, close, shutdown), so no one pushes into a dead channel.
 struct OutboundGuard(
-    std::sync::Arc<
-        std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OutgoingMessage>>>,
-    >,
+    std::sync::Arc<std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OutgoingMessage>>>>,
 );
 
 impl Drop for OutboundGuard {

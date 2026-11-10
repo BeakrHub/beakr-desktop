@@ -2,15 +2,32 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ignore::{WalkBuilder, WalkState};
 use serde_json::{json, Value};
 
-use crate::file_index::FileIndex;
+use crate::file_index::{FileIndex, IndexReadiness};
 use crate::security;
 use crate::unicode;
 
 const MAX_CLOUD_ONLY_PATHS_REPORTED: usize = 20;
+/// Longest a filename search waits for the index before answering. Kept well
+/// under the engine's 30-second wait for a tool reply (desktop_agent_broker
+/// REQUEST_TIMEOUT), so the agent always gets an answer it can act on.
+const INDEX_WAIT: Duration = Duration::from_secs(20);
+
+/// The answer while the first scan of the shared folders is still running:
+/// no results yet, and a reason the agent can relay instead of a silent miss.
+fn still_indexing_response() -> Value {
+    json!({
+        "results": [],
+        "indexing": true,
+        "note": "Beakr Desktop is still building its index of your shared folders \
+                 (the first scan after launch can take a few minutes on large folders). \
+                 Try the search again shortly.",
+    })
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum ContentSearchOutcome {
@@ -30,7 +47,7 @@ enum ContentSearchOutcome {
 pub async fn handle(
     params: Value,
     scoped_folders: &[String],
-    index: &FileIndex,
+    index: &Arc<FileIndex>,
 ) -> Result<(Value, Option<u64>), String> {
     let query = params
         .get("query")
@@ -59,14 +76,11 @@ pub async fn handle(
     // repeat queries. The index prunes denied dirs/files at build time and is
     // refreshed incrementally (unchanged directories are reused).
     if !search_content {
-        index.ensure_fresh(scoped_folders);
+        if index.prepare_search(scoped_folders, INDEX_WAIT) == IndexReadiness::StillIndexing {
+            return Ok((still_indexing_response(), None));
+        }
         let root_filter = path_param.map(PathBuf::from);
-        let hits = index.search_names(
-            query,
-            root_filter.as_deref(),
-            file_types.as_deref(),
-            limit,
-        );
+        let hits = index.search_names(query, root_filter.as_deref(), file_types.as_deref(), limit);
         let results: Vec<Value> = hits
             .iter()
             .map(|f| {
@@ -346,11 +360,7 @@ mod tests {
     fn content_search_skips_cloud_only_file_before_opening_it() {
         let missing = Path::new(r"C:\BeakrFixtures\cloud-only.txt");
 
-        let outcome = search_file_content_with_residency_check(
-            missing,
-            "needle",
-            |_| true,
-        );
+        let outcome = search_file_content_with_residency_check(missing, "needle", |_| true);
 
         assert!(matches!(outcome, ContentSearchOutcome::CloudOnly));
     }
@@ -362,9 +372,13 @@ mod tests {
         tree.write("todo.txt", "content");
         tree.write("nested/notebook.md", "content");
 
-        let (value, _) = handle(json!({ "query": "note" }), &tree.scoped(), &FileIndex::new())
-            .await
-            .unwrap();
+        let (value, _) = handle(
+            json!({ "query": "note" }),
+            &tree.scoped(),
+            &Arc::new(FileIndex::new()),
+        )
+        .await
+        .unwrap();
         let found = names(&value);
         assert!(found.contains(&"notes.md".to_string()), "got {found:?}");
         assert!(found.contains(&"notebook.md".to_string()), "got {found:?}");
@@ -379,7 +393,7 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "needle", "search_content": true }),
             &tree.scoped(),
-            &FileIndex::new(),
+            &Arc::new(FileIndex::new()),
         )
         .await
         .unwrap();
@@ -399,7 +413,7 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "app", "file_types": ["rs"] }),
             &tree.scoped(),
-            &FileIndex::new(),
+            &Arc::new(FileIndex::new()),
         )
         .await
         .unwrap();
@@ -416,13 +430,16 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "needle123", "search_content": true }),
             &tree.scoped(),
-            &FileIndex::new(),
+            &Arc::new(FileIndex::new()),
         )
         .await
         .unwrap();
         let found = names(&value);
         assert!(found.contains(&"config.txt".to_string()), "got {found:?}");
-        assert!(!found.contains(&".env".to_string()), "deny-listed .env leaked: {found:?}");
+        assert!(
+            !found.contains(&".env".to_string()),
+            "deny-listed .env leaked: {found:?}"
+        );
     }
 
     #[tokio::test]
@@ -435,10 +452,13 @@ mod tests {
         let result = handle(
             json!({ "query": "a", "path": outside }),
             &tree.scoped(),
-            &FileIndex::new(),
+            &Arc::new(FileIndex::new()),
         )
         .await;
-        assert!(result.is_err(), "expected out-of-scope error, got {result:?}");
+        assert!(
+            result.is_err(),
+            "expected out-of-scope error, got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -453,7 +473,7 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "needle_x", "search_content": true }),
             &tree.scoped(),
-            &FileIndex::new(),
+            &Arc::new(FileIndex::new()),
         )
         .await
         .unwrap();
@@ -471,7 +491,7 @@ mod tests {
         let (value, _) = handle(
             json!({ "query": "match", "limit": 2 }),
             &tree.scoped(),
-            &FileIndex::new(),
+            &Arc::new(FileIndex::new()),
         )
         .await
         .unwrap();
