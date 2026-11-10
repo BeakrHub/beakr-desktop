@@ -22,28 +22,48 @@ pruned walk plus a lightweight metadata cache over a heavyweight search index.
    (ripgrep's engine): multi-core, and denied directories are pruned at the
    directory level (`WalkState::Skip`) so we never descend into them.
 
-2. **In-memory metadata cache** (PR2). A `FileIndex` on `AppState` holds each
-   file's path + name for the scoped folders, so a filename/path search answers
-   from memory instead of re-walking disk. Freshness is per-directory: a
-   directory whose mtime is unchanged keeps its cached file list (skipped, no
-   I/O); a changed directory is re-read. Adding/removing a direct child bumps
-   the directory's mtime, so structural changes are always caught, and we still
-   recurse for deep changes. Content search still walks + reads (it must read
-   file bodies). `list_files` uses the same parallel walker.
+2. **In-memory metadata cache** (PR2, reworked in 0.6.2). A `FileIndex`
+   (`src-tauri/src/file_index/`) on `AppState` holds each file's name and
+   modification time, grouped by directory, so a filename/path search answers
+   from memory instead of re-walking disk. It holds no file contents and lives
+   only in the app process: rebuilt at launch, never written to disk or sent
+   anywhere. A file costs its name bytes plus a 16-byte slot; its full path is
+   rebuilt from the directory only for the files a search returns. Each
+   directory's lists sit behind an `Arc`, so a rescan shares unchanged
+   directories with the previous snapshot instead of copying them, and a
+   directory whose mtime is unchanged is not re-read (except on Windows, where
+   mtimes can miss rapid changes, ENG-1960). Content search still walks + reads
+   (it must read file bodies). `list_files` uses the same parallel walker.
 
 3. **Ranking** (PR3). Results are ranked by fuzzy match quality (`nucleo`, the
    Helix matcher — so `chat inpt` finds `chat-input.tsx`), then frecency (how
    often the file has been read via `read_file`), then recency (newest mtime),
    then name. Match quality dominates; the rest break ties.
 
-4. **Watcher + rescan fallback** (PR4). A `notify` filesystem watcher marks the
-   index dirty on change, so the next search re-walks immediately; a 30s timer
-   marks it dirty regardless, as the correctness backstop for events watchers
-   drop (missed events, per-user watch limits, coalesced/renamed entries). Both
-   layers only flip a flag, so bursts coalesce for free and no debouncer is
-   needed. `ensure_fresh` re-walks only when the flag is set, so most searches
-   skip the walk. This watch-plus-rescan pattern is what Spotlight and Everything
-   both use.
+4. **Watcher + rescan safety net** (PR4, reworked in 0.6.2). All index work
+   runs on one background thread (`beakr-file-index`); a search never waits
+   for a full scan once the index is built.
+   - A `notify` watcher reports changed paths. The index queues each path's
+     directory (dropping anything it does not index, such as `node_modules`
+     churn), waits 250 ms for a burst to settle, and re-reads only those
+     directories, scanning new subfolders and dropping deleted ones. A search
+     waits at most 2 s for queued changes, so a just-saved file is found.
+   - A full rescan runs at launch, when the shared folders change, when the
+     watcher reports dropped events, and on a safety-net timer: every 10
+     minutes while every folder is watched, every minute if one could not be.
+     It uses several threads and reuses unchanged directories.
+   - Until the first scan of the current folders finishes, a search waits at
+     most 20 s (under the engine's 30 s tool wait) and then answers
+     `indexing: true` with a note the agent relays.
+
+   Before 0.6.2, the watcher and a 30 s timer only set a dirty flag, and the
+   next search re-checked every directory before answering. With 4.7 million
+   files that was a 33 s re-check before most answers, and the first search
+   after launch walked everything inline (2.5 minutes) and dropped the
+   connection (fixed in 0.6.1 by moving the walk off the request).
+
+   Each completed full scan logs `File index: N files in M folders, scanned in
+   Xs` to the app log.
 
 Security is unchanged throughout: denied paths are pruned at build time and
 scope is re-checked at query time, so the cache can never surface a blocked
@@ -89,6 +109,25 @@ heavily, while the naive path is I/O-bound; in a release build and on larger or
 colder trees the walk cost dominates and the index avoids it entirely, so the
 gap widens. The one-time build is amortized by the dirty flag — steady-state
 queries pay only the cached cost, and never re-walk unless something changed.
+
+### Real folders (0.6.2)
+
+`bench_index_real_folders` (set `BEAKR_INDEX_BENCH_ROOTS` to colon-separated
+folders; run with `cargo test --release --lib bench_index_real_folders --
+--ignored --nocapture`) on one developer's Mac, 2026-11-10: Projects,
+Downloads, Desktop and Dropbox, 4.7 million files in about 500,000 folders,
+warm disk cache for both rows.
+
+| | 0.6.1 | 0.6.2 |
+|---|---|---|
+| Full scan from nothing | 116 s | 28 s |
+| Full rescan, nothing changed | 31 s | 6.8 s |
+| Memory after the scan | 2.0 GB | 0.44 GB |
+| Memory after a rescan | 4.2 GB | 0.51 GB |
+| One search | 1.4 to 5.0 s | 0.07 to 0.55 s |
+
+In 0.6.1 a search after any change also waited (up to 20 s) for the rescan;
+in 0.6.2 it waits only for the changed folders the watcher reported.
 
 ## Non-goals (deliberately deferred)
 

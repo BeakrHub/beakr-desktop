@@ -1,18 +1,16 @@
-//! Background maintenance that keeps the [`FileIndex`] fresh.
+//! Background maintenance that keeps the [`FileIndex`] current.
 //!
-//! Two layers, deliberately:
-//! 1. A **filesystem watcher** (`notify`) over the scoped folders marks the
-//!    index dirty on any change, so the next search re-walks immediately.
-//! 2. A **periodic fallback** marks the index dirty on a timer regardless.
-//!    Filesystem watchers are lossy — missed events, per-user watch limits,
-//!    coalesced/renamed entries — so the timer is the correctness backstop
-//!    (the same watch-plus-rescan pattern Spotlight and Everything use).
+//! - A **filesystem watcher** (`notify`) over the shared folders reports which
+//!   paths changed; the index re-reads just those directories, usually within
+//!   a second. If the watcher reports that it dropped events, the index gets a
+//!   full rescan instead.
+//! - A **safety-net timer** asks for a full rescan, because watchers are lossy
+//!   (missed events, per-user watch limits, coalesced renames). It is slow (10
+//!   minutes) while every folder is watched, and fast (1 minute) when one
+//!   could not be.
+//! - The folder set changing triggers a full rescan of the new set.
 //!
-//! Both layers only ever flip a flag; the flag naturally coalesces bursts of
-//! events, so no event debouncing is needed. The (incremental) re-walk runs on
-//! its own thread: at launch and whenever the folder set changes (below), and
-//! when a search finds the flag set (`FileIndex::prepare_search`), which waits
-//! for it only within a bound.
+//! The work itself runs on the index's own thread; nothing here blocks.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,57 +21,120 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use crate::file_index::FileIndex;
 use crate::state::AppState;
 
-/// How often the fallback marks the index dirty when no watcher event arrives.
-const RESCAN_FALLBACK: Duration = Duration::from_secs(30);
+/// How often to rescan everything while the watcher covers every folder.
+const FULL_RESCAN_WATCHED: Duration = Duration::from_secs(10 * 60);
 
-/// Start the periodic fallback and the (folder-set-aware) filesystem watcher.
+/// How often to rescan everything when some folder could not be watched, so
+/// its changes still show up within about a minute.
+const FULL_RESCAN_UNWATCHED: Duration = Duration::from_secs(60);
+
+/// Keep the index current for whatever folders are shared, for the life of
+/// the app.
 pub fn spawn(state: AppState) {
-    // Periodic rescan fallback.
-    {
-        let index = state.file_index.clone();
-        tauri::async_runtime::spawn(async move {
-            let mut ticker = tokio::time::interval(RESCAN_FALLBACK);
-            // The immediate first tick is harmless (index starts dirty anyway).
-            loop {
-                ticker.tick().await;
-                index.mark_dirty();
-            }
-        });
-    }
-
-    // Filesystem watcher, rebuilt whenever the scoped folders change.
     tauri::async_runtime::spawn(async move {
         loop {
             let folders = state.scoped_folders.read().await.clone();
-            // Build (or rebuild) the index now, on its own thread, so the first
-            // search after launch or after a folder change finds it ready
-            // instead of walking every shared folder inside the request.
-            state.file_index.start_refresh(&folders);
-            // Keep the watcher alive for as long as these roots are current.
-            let _watcher = build_watcher(&folders, state.file_index.clone());
-            // A new folder set makes these roots (and the watcher) stale.
-            // Waits on the watcher's own channel — sharing folders_changed
-            // with the WS client starved one of them (ENG-1624).
-            state.watch_folders_changed.notified().await;
-            state.file_index.mark_dirty();
+            // Build (or rebuild) the index now, in the background, so the first
+            // search after launch or after a folder change finds it ready.
+            state.file_index.request_full_scan(&folders);
+            let (watcher, all_watched) = build_watcher(&folders, state.file_index.clone());
+            let every = if all_watched {
+                FULL_RESCAN_WATCHED
+            } else {
+                FULL_RESCAN_UNWATCHED
+            };
+            let mut safety_net =
+                tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            loop {
+                tokio::select! {
+                    // Waits on the watcher's own channel; sharing folders_changed
+                    // with the WS client starved one of them (ENG-1624).
+                    _ = state.watch_folders_changed.notified() => break,
+                    _ = safety_net.tick() => state.file_index.request_full_scan(&folders),
+                }
+            }
+            drop(watcher); // these roots are stale; the next pass watches the new set
         }
     });
 }
 
-/// Build a recursive watcher over `folders` that marks `index` dirty on any
-/// event. Returns the watcher, which must be held alive to keep watching.
-fn build_watcher(folders: &[String], index: Arc<FileIndex>) -> Option<RecommendedWatcher> {
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
-            index.mark_dirty();
+/// Build a recursive watcher over `folders` that tells `index` which paths
+/// changed. Returns the watcher, which must be held alive to keep watching,
+/// and whether every folder is being watched.
+fn build_watcher(folders: &[String], index: Arc<FileIndex>) -> (Option<RecommendedWatcher>, bool) {
+    let roots = folders.to_vec();
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let Ok(event) = res else {
+            return;
+        };
+        if event.need_rescan() {
+            index.request_full_scan(&roots);
+        } else {
+            index.note_changed_paths(event.paths);
         }
-    })
-    .ok()?;
-
+    });
+    let mut watcher = match watcher {
+        Ok(w) => w,
+        Err(error) => {
+            log::warn!("File index: no filesystem watcher ({error}); rescanning every minute");
+            return (None, false);
+        }
+    };
+    let mut all_watched = true;
     for folder in folders {
-        // Best effort: a folder that can't be watched (permissions, watch-limit
-        // exhaustion on deep trees) is still covered by the periodic fallback.
-        let _ = watcher.watch(Path::new(folder), RecursiveMode::Recursive);
+        // A folder that can't be watched (permissions, watch-limit exhaustion
+        // on deep trees) is still covered by the faster safety net.
+        if let Err(error) = watcher.watch(Path::new(folder), RecursiveMode::Recursive) {
+            log::warn!(
+                "File index: cannot watch a shared folder ({error}); rescanning every minute"
+            );
+            all_watched = false;
+        }
     }
-    Some(watcher)
+    (Some(watcher), all_watched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_index::IndexReadiness;
+    use std::time::Instant;
+
+    /// End to end through the platform watcher: a file created after the index
+    /// is built is found by a search within seconds, with no full rescan. On
+    /// macOS the temp folder is reached through a symlink (`/var` ->
+    /// `/private/var`) and the watcher reports real paths, so this also covers
+    /// shared folders like `~/Dropbox` that are symlinks.
+    #[test]
+    fn a_file_created_after_the_index_is_built_is_found_within_seconds() {
+        let root = std::env::temp_dir().join(format!("beakr_watch_e2e_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("inbox")).unwrap();
+        let roots = vec![root.display().to_string()];
+        let index = Arc::new(FileIndex::new());
+        index.refresh(&roots);
+        let (watcher, all_watched) = build_watcher(&roots, index.clone());
+        assert!(watcher.is_some() && all_watched);
+        std::thread::sleep(Duration::from_millis(500)); // let the watch stream start
+
+        std::fs::write(root.join("inbox/quarterly_forecast_v7.xlsx"), "x").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut found = false;
+        while Instant::now() < deadline && !found {
+            let ready = index.prepare_search(&roots, Duration::ZERO, Duration::from_secs(2));
+            assert_eq!(ready, IndexReadiness::Ready);
+            found = !index
+                .search_names("quarterly_forecast_v7", None, None, 5)
+                .is_empty();
+            if !found {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        drop(watcher);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            found,
+            "the watcher never delivered the new file to the index"
+        );
+    }
 }
