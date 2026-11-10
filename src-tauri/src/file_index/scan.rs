@@ -182,17 +182,20 @@ pub(super) fn full_scan(roots: &[String], old: &IndexState) -> IndexState {
         .filter(|root| !security::is_denied(root)) // never index a denied root
         .collect();
     let dirs: HashMap<Arc<Path>, DirEntry> = walk(starts, true, reusable).into_iter().collect();
-    let real_roots = roots
+    let resolved: Vec<(PathBuf, PathBuf)> = roots
         .iter()
         .filter_map(|root| {
             let shared = PathBuf::from(root);
-            let real = std::fs::canonicalize(&shared).ok()?;
-            (real != shared).then_some((real, shared))
+            Some((std::fs::canonicalize(&shared).ok()?, shared))
         })
         .collect();
     IndexState {
         roots: roots.to_vec(),
-        real_roots,
+        canonical_roots: resolved.iter().map(|(real, _)| real.clone()).collect(),
+        real_roots: resolved
+            .into_iter()
+            .filter(|(real, shared)| real != shared)
+            .collect(),
         dirs,
     }
 }
@@ -226,7 +229,24 @@ pub(super) fn rescan_dirs(changed: &HashSet<PathBuf>, current: &IndexState) -> C
             .roots
             .iter()
             .any(|root| Path::new(root) == dir.as_path());
-        match read_directory(dir, is_root) {
+        // A full scan walks down from the roots and stops at any symlink, but
+        // this re-reads one folder by path, so a parent replaced by a symlink
+        // would be followed. Read it only if it still resolves inside a root.
+        let inside = is_root
+            || std::fs::canonicalize(dir)
+                .map(|real| {
+                    current
+                        .canonical_roots
+                        .iter()
+                        .any(|root| real.starts_with(root))
+                })
+                .unwrap_or(false);
+        let read = if inside {
+            read_directory(dir, is_root)
+        } else {
+            None
+        };
+        match read {
             None => changes.removed.push(Arc::clone(key)),
             Some(entry) => {
                 let before: HashSet<&Arc<Path>> = old_entry.subdirs.iter().collect();
@@ -254,10 +274,18 @@ pub(super) fn rescan_dirs(changed: &HashSet<PathBuf>, current: &IndexState) -> C
 
 /// Apply [`Changes`] to the live snapshot.
 pub(super) fn apply(state: &mut IndexState, changes: Changes) {
-    for dir in changes.removed.iter().chain(&changes.dropped_subdirs) {
+    let gone: Vec<&Arc<Path>> = changes
+        .removed
+        .iter()
+        .chain(&changes.dropped_subdirs)
+        .collect();
+    for dir in &gone {
         state.remove_subtree(dir);
     }
     for (dir, entry) in changes.updated {
-        state.dirs.insert(dir, entry);
+        // Never re-add a folder below one this same batch removed.
+        if !gone.iter().any(|g| dir.starts_with(g.as_ref())) {
+            state.dirs.insert(dir, entry);
+        }
     }
 }

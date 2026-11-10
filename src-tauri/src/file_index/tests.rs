@@ -486,6 +486,33 @@ fn an_indexed_folder_replaced_by_a_symlink_is_not_followed() {
         .is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_folder_whose_parent_became_a_symlink_is_not_followed_by_a_watcher_update() {
+    // Second half of the symlink check: only the parent was swapped, so the
+    // re-read folder itself is a real directory, just outside the shared
+    // folders now.
+    let shared = TempTree::new("parent_swap_shared");
+    let outside = TempTree::new("parent_swap_outside");
+    shared.write("a/b/plan.md", "x");
+    outside.write("b/secret_outside_scope.txt", "x");
+    let index = Arc::new(FileIndex::new());
+    index.refresh(&shared.scoped());
+
+    fs::remove_dir_all(shared.root.join("a")).unwrap();
+    std::os::unix::fs::symlink(&outside.root, shared.root.join("a")).unwrap();
+    let changed: HashSet<PathBuf> = [shared.root.join("a/b")].into_iter().collect();
+    index.apply_changes(&changed);
+
+    assert!(index
+        .search_names("secret outside", None, None, 20)
+        .is_empty());
+    assert!(!index
+        .snapshot()
+        .dirs
+        .contains_key(shared.root.join("a/b").as_path()));
+}
+
 #[test]
 fn applying_changes_adds_new_folders_and_drops_deleted_ones() {
     let tree = TempTree::new("apply_changes");
@@ -564,7 +591,7 @@ fn synthetic_state(dirs: usize, per_dir: usize) -> IndexState {
         roots: vec![root.display().to_string()],
         ..Default::default()
     };
-    assert!(state.real_roots.is_empty());
+    assert!(state.real_roots.is_empty() && state.canonical_roots.is_empty());
     for d in 0..dirs {
         let files = (0..per_dir)
             .map(|f| (format!("file_{d}_{f}.txt"), (d * per_dir + f) as i64))

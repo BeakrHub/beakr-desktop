@@ -98,6 +98,10 @@ pub(super) struct IndexState {
     /// (`~/Dropbox` is often one). The watcher reports real paths; these map
     /// them back to the paths the index is keyed by.
     pub(super) real_roots: Vec<(PathBuf, PathBuf)>,
+    /// Every root's real location. A folder re-read on its own (a watcher
+    /// update) must resolve under one of these, so a parent folder replaced
+    /// by a symlink cannot lead outside the shared folders.
+    pub(super) canonical_roots: Vec<PathBuf>,
     pub(super) dirs: HashMap<Arc<Path>, DirEntry>,
 }
 
