@@ -12,10 +12,16 @@ use crate::security;
 use crate::unicode;
 
 const MAX_CLOUD_ONLY_PATHS_REPORTED: usize = 20;
-/// Longest a filename search waits for the index before answering. Kept well
-/// under the engine's 30-second wait for a tool reply (desktop_agent_broker
-/// REQUEST_TIMEOUT), so the agent always gets an answer it can act on.
-const INDEX_WAIT: Duration = Duration::from_secs(20);
+
+/// How long the first search after launch waits for the first scan before
+/// answering "still indexing". Stays under the engine's 30-second wait for a
+/// tool reply, so the agent always gets an answer.
+const FIRST_SCAN_WAIT: Duration = Duration::from_secs(20);
+
+/// How long a search over a built index waits for changes the watcher just
+/// reported (normally applied in well under a second), so a file saved a
+/// moment ago is found.
+const CHANGE_WAIT: Duration = Duration::from_secs(2);
 
 /// The answer while the first scan of the shared folders is still running:
 /// no results yet, and a reason the agent can relay instead of a silent miss.
@@ -74,9 +80,10 @@ pub async fn handle(
 
     // Filename/path search is served from the in-memory index — no disk walk on
     // repeat queries. The index prunes denied dirs/files at build time and is
-    // refreshed incrementally (unchanged directories are reused).
+    // kept current in the background (see `file_index`).
     if !search_content {
-        if index.prepare_search(scoped_folders, INDEX_WAIT) == IndexReadiness::StillIndexing {
+        let readiness = index.prepare_search(scoped_folders, FIRST_SCAN_WAIT, CHANGE_WAIT);
+        if readiness == IndexReadiness::StillIndexing {
             return Ok((still_indexing_response(), None));
         }
         let root_filter = path_param.map(PathBuf::from);
